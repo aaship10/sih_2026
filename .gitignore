@@ -1,2 +1,8 @@
+# MATLAB
+slprj/
+*.slxc
+*.autosave
+
+# Python
 __pycache__/
 venv/
