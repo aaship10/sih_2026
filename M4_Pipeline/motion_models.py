@@ -1,0 +1,285 @@
+"""
+motion_models.py
+================
+Baseline (Section 10): CONSTANT VELOCITY. M3's Kalman filter already
+gives clean smoothed velocity, so the baseline just projects it
+forward -- no re-derivation needed. This is `constant_velocity_rollout`,
+used both as the CV branch for tracked objects (multimodal.py) and as
+the ego's own nominal short-horizon projection (interface.py).
+
+Everything past the baseline is built as SEPARATE ROLLOUT FUNCTIONS
+(constant acceleration / lateral deviation / stop) rather than one
+"smart" model, so each stays a few lines and is independently
+testable -- multimodal.py picks which ones to call and blends their
+probabilities.
+
+CLASS-SPECIFIC BEHAVIOR (Section 12) is a single flat dict,
+CLASS_PARAMS, per the core design decision: "a single Python dict of
+parameters (turn radius bound, lateral accel bound, stop probability,
+uncertainty growth rate) per class -- not separate models." This is
+the one place that dict lives; multimodal.py and uncertainty.py both
+import it from here so a class's whole behavior profile (how sharply
+it can swerve, how likely it is to stop, how fast its uncertainty
+balloons) is tunable in one spot instead of scattered across files.
+
+class strings are exact ("pedestrian", "auto_rickshaw" with the
+underscore, per the integration notes) -- get_class_params() falls
+back to DEFAULT_CLASS_PARAMS for anything that doesn't match, instead
+of raising, so a class-string typo degrades gracefully rather than
+crashing M4 mid-scenario.
+"""
+
+import math
+
+# turn_radius_bound isn't used directly by the rollout functions below
+# (we use a lateral-ACCEL bound instead, which is simpler to integrate
+# into a rollout without a full bicycle-model curvature calculation --
+# see lateral_deviation_rollout) but is kept in the dict since Section
+# 12 asks for it explicitly and it's useful context for the report /
+# for a future M5 that wants a sanity bound on how sharply a class can
+# realistically turn.
+CLASS_PARAMS = {
+    "pedestrian": {
+        "max_lateral_accel": 1.5,    # m/s^2 -- can swerve/step aside quickly
+        "turn_radius_bound": 0.3,    # m -- effectively "can pivot in place"
+        "stop_decel": 1.5,           # m/s^2 -- can stop mid-stride fast
+        "stop_probability": 0.15,    # Section 12: "may stop"
+        "crossing_weight_base": 0.30,  # Section 12: "may cross / suddenly enter road"
+        "uncertainty_k": 0.60,       # high -- unpredictable, Section 22 high safety priority
+    },
+    "bicycle": {
+        "max_lateral_accel": 2.0,
+        "turn_radius_bound": 1.0,
+        "stop_decel": 2.5,
+        "stop_probability": 0.10,
+        "crossing_weight_base": 0.25,
+        "uncertainty_k": 0.50,
+    },
+    "motorcycle": {
+        "max_lateral_accel": 3.0,    # Section 12: "can move laterally quickly / filter"
+        "turn_radius_bound": 1.5,
+        "stop_decel": 4.0,
+        "stop_probability": 0.08,
+        "crossing_weight_base": 0.30,  # can overtake/filter -- frequent lateral moves
+        "uncertainty_k": 0.45,
+    },
+    "auto_rickshaw": {
+        "max_lateral_accel": 1.8,    # Section 12: "can change lateral position / merge informally"
+        "turn_radius_bound": 2.5,
+        "stop_decel": 3.5,           # Section 12: "can slow/stop suddenly"
+        "stop_probability": 0.20,
+        "crossing_weight_base": 0.20,
+        "uncertainty_k": 0.40,
+    },
+    "car": {
+        "max_lateral_accel": 1.5,
+        "turn_radius_bound": 4.0,
+        "stop_decel": 4.5,
+        "stop_probability": 0.10,
+        "crossing_weight_base": 0.15,  # Section 12: "more predictable than pedestrians"
+        "uncertainty_k": 0.30,
+    },
+    "bus": {
+        "max_lateral_accel": 0.6,    # Section 12: "slower lateral movement"
+        "turn_radius_bound": 9.0,    # Section 12: "larger turning radius"
+        "stop_decel": 2.5,
+        "stop_probability": 0.05,
+        "crossing_weight_base": 0.08,
+        "uncertainty_k": 0.25,       # large + slow -- most predictable class
+    },
+    "truck": {
+        "max_lateral_accel": 0.6,
+        "turn_radius_bound": 9.0,
+        "stop_decel": 2.5,
+        "stop_probability": 0.05,
+        "crossing_weight_base": 0.08,
+        "uncertainty_k": 0.25,
+    },
+    "pushcart": {
+        "max_lateral_accel": 1.0,
+        "turn_radius_bound": 0.8,
+        "stop_decel": 1.5,
+        "stop_probability": 0.15,
+        "crossing_weight_base": 0.20,
+        "uncertainty_k": 0.50,
+    },
+    "animal": {
+        "max_lateral_accel": 2.5,    # Section 12/33: highly uncertain, sharp direction changes
+        "turn_radius_bound": 0.5,
+        "stop_decel": 2.0,
+        "stop_probability": 0.25,    # may stop mid-crossing
+        "crossing_weight_base": 0.35,
+        "uncertainty_k": 0.90,       # highest of any class -- Section 33
+    },
+        "pothole": {
+        "max_lateral_accel": 0.0,
+        "turn_radius_bound": 0.0,
+        "stop_decel": 0.0,
+        "stop_probability": 0.98,
+        "crossing_weight_base": 0.01,
+        "uncertainty_k": 0.02,
+    },
+
+    "speed_bump": {
+        "max_lateral_accel": 0.0,
+        "turn_radius_bound": 0.0,
+        "stop_decel": 0.0,
+        "stop_probability": 0.98,
+        "crossing_weight_base": 0.01,
+        "uncertainty_k": 0.02,
+    },
+
+    "barricade": {
+        "max_lateral_accel": 0.0,
+        "turn_radius_bound": 0.0,
+        "stop_decel": 0.0,
+        "stop_probability": 0.98,
+        "crossing_weight_base": 0.01,
+        "uncertainty_k": 0.02,
+    },
+
+    "static_obstacle": {
+        "max_lateral_accel": 0.0,
+        "turn_radius_bound": 0.0,
+        "stop_decel": 0.0,
+        "stop_probability": 0.98,
+        "crossing_weight_base": 0.01,
+        "uncertainty_k": 0.02,
+    },
+}
+
+# Fallback for any class string that doesn't exactly match CLASS_PARAMS
+# (integration notes: "must match these exactly or objects silently
+# fall back to a default") -- deliberately mid-range on every axis so
+# an unrecognized class degrades to "moderately cautious", not to
+# either extreme.
+DEFAULT_CLASS_PARAMS = {
+    "max_lateral_accel": 1.2,
+    "turn_radius_bound": 3.0,
+    "stop_decel": 2.5,
+    "stop_probability": 0.12,
+    "crossing_weight_base": 0.18,
+    "uncertainty_k": 0.45,
+}
+
+
+def get_class_params(cls):
+    return CLASS_PARAMS.get(cls, DEFAULT_CLASS_PARAMS)
+
+
+def constant_velocity_rollout(start_xy, velocity_xy, horizon, time_step):
+    """
+    The baseline (Section 10). Also used as the ego's own nominal
+    short-horizon projection (interface.py._nominal_ego_path) and as
+    the fallback ego path in ttc.time_to_conflict().
+
+    Returns n_steps = round(horizon / time_step) points, at
+    t = time_step, 2*time_step, ..., horizon (does NOT include t=0 --
+    every branch/rollout in this file is "where will it be AFTER this
+    much time", matching interface.py's time_step-indexed uncertainty
+    and TTC/time-to-conflict lookups).
+    """
+    n_steps = max(1, round(horizon / time_step))
+    x0, y0 = start_xy
+    vx, vy = velocity_xy
+    return [
+        [round(x0 + vx * i * time_step, 3), round(y0 + vy * i * time_step, 3)]
+        for i in range(1, n_steps + 1)
+    ]
+
+
+def constant_acceleration_rollout(start_xy, velocity_xy, accel_xy, horizon, time_step):
+    """
+    Section 10 option B, kept available for the baseline-comparison
+    experiment (Section 44: CV vs class-aware, and this sits between
+    them) -- x = x0 + v*t + 0.5*a*t^2, using derive.py's finite-
+    difference acceleration directly. Not used by default in
+    multimodal.py's branch set (a single noisy finite-difference accel
+    sample projected 3s out can drift a lot -- the class-bounded
+    lateral/stop branches are a more controlled way to cover
+    "something other than constant velocity"), but kept here as a
+    documented, testable option for the roadmap's Phase 4/5 comparison.
+    """
+    n_steps = max(1, round(horizon / time_step))
+    x0, y0 = start_xy
+    vx, vy = velocity_xy
+    ax, ay = accel_xy
+    points = []
+    for i in range(1, n_steps + 1):
+        t = i * time_step
+        x = x0 + vx * t + 0.5 * ax * t * t
+        y = y0 + vy * t + 0.5 * ay * t * t
+        points.append([round(x, 3), round(y, 3)])
+    return points
+
+
+def lateral_deviation_rollout(start_xy, velocity_xy, horizon, time_step, lateral_accel):
+    """
+    Branch B (Section 13, "crossing"/turn mode): same forward progress
+    as CV, plus a constant lateral acceleration applied PERPENDICULAR
+    to the current velocity direction -- models a pedestrian veering
+    into a crossing, a motorcycle filtering sideways, an animal cutting
+    across, WITHOUT needing a full bicycle-model / curvature-based turn
+    (Section 11 explicitly rules out building this around lane/Frenet
+    geometry, and a full curvature model is more machinery than a
+    heuristic 2-3-branch predictor needs).
+
+    lateral_accel: SIGNED magnitude (m/s^2) -- sign picked by the
+    caller (multimodal._lateral_sign, using the object's own recent
+    velocity history) to decide which of the two perpendicular
+    directions to veer toward. Magnitude should already be clamped to
+    the class's max_lateral_accel bound by the caller.
+    """
+    n_steps = max(1, round(horizon / time_step))
+    speed = math.hypot(velocity_xy[0], velocity_xy[1])
+
+    if speed < 1e-3:
+        # No established direction of travel -- "perpendicular to
+        # velocity" is undefined for a near-stationary object. The
+        # stop branch already models "stays roughly put" better than
+        # an arbitrary swerve axis would, so just hold position here.
+        return [[round(start_xy[0], 3), round(start_xy[1], 3)] for _ in range(n_steps)]
+
+    heading = math.atan2(velocity_xy[1], velocity_xy[0])
+    perp = heading + math.pi / 2.0
+
+    x0, y0 = start_xy
+    points = []
+    for i in range(1, n_steps + 1):
+        t = i * time_step
+        forward_dist = speed * t
+        lateral_dist = 0.5 * lateral_accel * t * t
+        x = x0 + math.cos(heading) * forward_dist + math.cos(perp) * lateral_dist
+        y = y0 + math.sin(heading) * forward_dist + math.sin(perp) * lateral_dist
+        points.append([round(x, 3), round(y, 3)])
+    return points
+
+
+def stop_rollout(start_xy, velocity_xy, horizon, time_step, deceleration):
+    """
+    Branch C (Section 13, "stop" mode): decelerate along the current
+    heading at a class-bounded rate until velocity reaches zero, then
+    hold position -- covers "pedestrian stops mid-crossing",
+    "auto-rickshaw stops suddenly", "animal stops" (Section 12).
+    """
+    n_steps = max(1, round(horizon / time_step))
+    speed = math.hypot(velocity_xy[0], velocity_xy[1])
+    x0, y0 = start_xy
+
+    if speed < 1e-3:
+        return [[round(x0, 3), round(y0, 3)] for _ in range(n_steps)]
+
+    heading = math.atan2(velocity_xy[1], velocity_xy[0])
+    time_to_stop = speed / deceleration if deceleration > 1e-6 else 0.0
+
+    points = []
+    for i in range(1, n_steps + 1):
+        t = i * time_step
+        if t <= time_to_stop:
+            dist = speed * t - 0.5 * deceleration * t * t
+        else:
+            dist = speed * time_to_stop - 0.5 * deceleration * time_to_stop * time_to_stop
+        x = x0 + math.cos(heading) * dist
+        y = y0 + math.sin(heading) * dist
+        points.append([round(x, 3), round(y, 3)])
+    return points
