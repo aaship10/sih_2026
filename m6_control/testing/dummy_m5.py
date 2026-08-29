@@ -3,6 +3,31 @@ import math
 from interfaces.data_types import PlannedTrajectory, TrajectoryPoint
 
 class DummyM5:
+
+    def generate_avoidance_trajectory(self, start_x, start_y, start_yaw, target_v=5.0):
+        traj = PlannedTrajectory()
+        
+        for i in range(50):
+            # Normal forward progress
+            forward_dist = i * 1.0 
+            
+            # Shift 3 meters left gradually over the first 10 meters
+            lateral_shift = 0.0
+            if i < 10:
+                lateral_shift = (i / 10.0) * 3.0
+            else:
+                lateral_shift = 3.0
+                
+            # Calculate world coordinates with the lateral shift
+            pt_x = start_x + (forward_dist * math.cos(start_yaw)) - (lateral_shift * math.sin(start_yaw))
+            pt_y = start_y + (forward_dist * math.sin(start_yaw)) + (lateral_shift * math.cos(start_yaw))
+
+            traj.points.append(
+                TrajectoryPoint(x=pt_x, y=pt_y, heading=start_yaw, velocity=target_v)
+            )
+        traj.is_valid = True
+        return traj
+
     def generate_straight_trajectory(self, start_x, start_y, start_yaw, target_v=5.0):
         traj = PlannedTrajectory()
         for i in range(50):
