@@ -73,3 +73,23 @@ class PlanningOutput:
     emergency_stop: bool                         # Hard brake flag for M6
     computation_time_ms: float                   # Latency metric
     timestamp: float
+
+import time
+from dataclasses import dataclass, field
+from typing import List
+
+# Change this class at the bottom of data_types.py
+@dataclass
+class TrajectoryPoint:
+    x: float
+    y: float
+    yaw: float          # Changed from 'heading'
+    v_target: float     # Changed from 'velocity'
+    t: float = 0.0      # Changed from 'time_offset'
+
+@dataclass
+class PlannedTrajectory:
+    timestamp: float = field(default_factory=time.time)
+    points: List[TrajectoryPoint] = field(default_factory=list)
+    target_behavior: str = "TRACK"  # "TRACK", "STOP", "EMERGENCY"
+    is_valid: bool = True

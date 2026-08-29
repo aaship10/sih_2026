@@ -11,7 +11,7 @@ class StanleyController:
 
     def calculate_steering(self, ego_x, ego_y, ego_yaw, ego_v, target_point):
         # 1. Heading Error
-        yaw_target = target_point.heading
+        yaw_target = target_point.yaw  # Changed from .heading
         yaw_error = normalize_angle(yaw_target - ego_yaw)
 
         # 2. Cross-Track Error

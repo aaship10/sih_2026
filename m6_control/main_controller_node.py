@@ -1,97 +1,81 @@
+import sys
+import os
+# Ensure Python can find the root modules when running from inside m6_control
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import time
-from interfaces.carla_interface import CarlaInterface
-from testing.dummy_m5 import DummyM5
-from controllers.lateral_stanley import StanleyController
-from controllers.longitudinal_pid import LongitudinalPID
-from controllers.safety_supervisor import SafetySupervisor
-from utils.coordinate_transforms import get_closest_waypoint_index
-from utils.metrics_logger import MetricsLogger
+import zmq
+from m6_control.interfaces.carla_interface import CarlaInterface
+from m6_control.interfaces.m5_adapter import M5Adapter
+from m6_control.controllers.lateral_stanley import StanleyController
+from m6_control.controllers.longitudinal_pid import LongitudinalPID
+from m6_control.controllers.safety_supervisor import SafetySupervisor
+from m6_control.utils.coordinate_transforms import get_closest_waypoint_index
+from m6_control.utils.metrics_logger import MetricsLogger
 
 def main():
-    print("Initializing M6 Controller Node...")
+    print("Initializing M6 Controller Node (Integrated)...")
     
     carla_iface = CarlaInterface()
-    if not carla_iface.ego_vehicle:
-        print("Waiting for ego vehicle to be spawned by M1...")
-        return
+    
+    # Wait continuously until the vehicle is spawned
+    while not carla_iface.ego_vehicle:
+        print("Waiting for ego vehicle to be spawned by M1/CARLA...")
+        time.sleep(2.0)
+        # Re-poll the CARLA world for the vehicle
+        carla_iface = CarlaInterface()
+        
+    print("Ego vehicle found! Connecting to M5...")
 
-    # Initialize M6 Components
+    # Setup ZeroMQ Subscriber to listen to M5
+    context = zmq.Context()
+    socket = context.socket(zmq.SUB)
+    socket.connect("tcp://127.0.0.1:5555")
+    socket.setsockopt_string(zmq.SUBSCRIBE, "")
+
     stanley = StanleyController(k_gain=4.0) 
     pid = LongitudinalPID(kp=1.0, ki=0.1, kd=0.05)
     supervisor = SafetySupervisor(timeout_threshold=1.0)
     logger = MetricsLogger()
-    dummy_planner = DummyM5()
 
-    # Control Loop Frequency (50 Hz)
     dt = 0.02
-    
-    # Get initial position
-    ego_x, ego_y, ego_yaw, ego_speed = carla_iface.get_ego_state()
-    
-    # Start with a normal straight trajectory
-    current_trajectory = dummy_planner.generate_straight_trajectory(ego_x, ego_y, ego_yaw, target_v=6.0)
-    
-    # Track when we started so we can trigger the replan event
-    mission_start_time = time.time()
-    has_replanned = False
+    current_trajectory = None
 
     try:
         while True:
             start_time = time.time()
-
-            # 1. Get Ego State
             ego_x, ego_y, ego_yaw, ego_speed = carla_iface.get_ego_state()
 
-            # --- PHASE 14: TRIGGER REPLAN AFTER 2 SECONDS ---
-            if not has_replanned and (time.time() - mission_start_time > 2.0):
-                print("\n[EVENT] Sudden Obstacle! Generating Avoidance Path...\n")
-                # Generate new path from the vehicle's CURRENT position
-                current_trajectory = dummy_planner.generate_avoidance_trajectory(ego_x, ego_y, ego_yaw, target_v=6.0)
-                has_replanned = True
-            # ------------------------------------------------
+            # 2. Pull Data from M5
+            try:
+                m5_msg = socket.recv_json(flags=zmq.NOBLOCK)
+                print(f"\n[NETWORK SUCCESS] Received message with {len(m5_msg.get('trajectory', []))} points!")
+                m5_msg["timestamp"] = time.time() 
+                current_trajectory = M5Adapter.parse_message(m5_msg, ego_x, ego_y, ego_yaw)
+            except zmq.Again:
+                # No message this tick
+                pass 
+            except Exception as e:
+                print(f"[NETWORK ERROR] Failed to parse message: {e}")
 
-            # Keep dummy trajectory fresh so SafetySupervisor doesn't trigger a timeout
-            current_trajectory.timestamp = time.time()
-
-            # 2. Safety Supervision
-            state = supervisor.evaluate_state(current_trajectory)
-
-            if state == "EMERGENCY_BRAKE":
-                carla_iface.apply_control(steer=0.0, throttle=0.0, brake=1.0, hand_brake=True)
-                
-            elif state == "WAIT_FOR_PLAN":
+            # 3. Raw Execution
+            if not current_trajectory or not current_trajectory.points:
+                # We will only print this once every 50 ticks to not spam the console
+                if int(time.time() * 10) % 10 == 0:
+                    print("DEBUG: Waiting for M5 data over ZMQ...")
                 carla_iface.apply_control(steer=0.0, throttle=0.0, brake=1.0)
-
-            elif state == "TRACKING":
-                # Find closest point
+            else:
                 idx = get_closest_waypoint_index(ego_x, ego_y, current_trajectory.points)
-                
-                # Check if we reached the end of the dummy path
-                if idx >= len(current_trajectory.points) - 2:
-                    # Hold the stop so we can observe the final behavior
-                    carla_iface.apply_control(steer=0.0, throttle=0.0, brake=1.0)
-                    print("Reached end of dummy trajectory. Holding stop. Press Ctrl+C to view metrics.")
-                else:
-                    target_point = current_trajectory.points[idx]
+                target_point = current_trajectory.points[idx]
+                lookahead_idx = min(idx + 3, len(current_trajectory.points) - 1)
+                target_speed = current_trajectory.points[lookahead_idx].v_target
 
-                    # Lookahead for target speed (prevents braking too late)
-                    lookahead_idx = min(idx + 3, len(current_trajectory.points) - 1)
-                    target_speed = current_trajectory.points[lookahead_idx].velocity
+                steer, cte = stanley.calculate_steering(ego_x, ego_y, ego_yaw, ego_speed, target_point)
+                throttle, brake, speed_error = pid.calculate_throttle_brake(target_speed, ego_speed)
 
-                    # Calculate Controls
-                    steer, cte = stanley.calculate_steering(ego_x, ego_y, ego_yaw, ego_speed, target_point)
-                    throttle, brake, speed_error = pid.calculate_throttle_brake(target_speed, ego_speed)
+                print(f"DEBUG | EgoV: {ego_speed:.1f} | TargetV: {target_speed:.1f} | Thr: {throttle:.2f} | Brk: {brake:.2f} | CTE: {cte:.2f}")
+                carla_iface.apply_control(steer, throttle, brake)
 
-                    # Log metrics
-                    logger.log_step(cte, speed_error)
-
-                    # Apply to CARLA
-                    carla_iface.apply_control(steer, throttle, brake)
-                    
-                    # Live terminal output for debugging
-                    print(f"Target V: {target_speed:.1f} m/s | Ego V: {ego_speed:.1f} m/s | Steer: {steer:.3f} | CTE: {cte:.3f} m")
-
-            # Enforce loop rate
             elapsed = time.time() - start_time
             if elapsed < dt:
                 time.sleep(dt - elapsed)
@@ -99,7 +83,6 @@ def main():
     except KeyboardInterrupt:
         print("\nStopping M6 Controller Node.")
         carla_iface.apply_control(steer=0.0, throttle=0.0, brake=1.0)
-        logger.print_summary()
 
 if __name__ == '__main__':
     main()
