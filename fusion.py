@@ -22,7 +22,7 @@ per the project's "don't overengineer" guidance):
         4. Merge: class+confidence (camera) + position (LiDAR) +
            velocity (radar) = one fused object.
 
-SPECIAL CASE -- ROAD-SURFACE CLASSES (pothole, speed_bump):
+SPECIAL CASE -- ROAD-SURFACE CLASSES (pothole, speed_bumps):
     lidar_processing.remove_ground() deletes any point near road
     height, because normally that IS just the boring road surface.
     But a pothole or speed bump genuinely lives at that same height
@@ -107,7 +107,7 @@ def match_raw_points_to_camera(camera_det, raw_points, camera_intrinsics, camera
                                  min_points=3, height_range=(-0.3, 0.3)):
     """
     Alternative to match_lidar_to_camera(), used ONLY for road-surface
-    classes (pothole, speed_bump). Instead of matching against
+    classes (pothole, speed_bumps). Instead of matching against
     pre-computed clusters (which ground removal already stripped these
     points out of), this projects each RAW point directly into the
     image and keeps whichever ones fall inside the camera's bbox.
@@ -120,7 +120,7 @@ def match_raw_points_to_camera(camera_det, raw_points, camera_intrinsics, camera
         distance. Since potholes/speed bumps are physically flat (a
         few cm at most), we can reject implausible points outright.
         Use a NEGATIVE range for pothole (it's a dip below road level)
-        and a small POSITIVE range for speed_bump (it's a slight
+        and a small POSITIVE range for speed_bumps (it's a slight
         rise) -- this is tighter than one symmetric cutoff and
         correctly excludes even a pedestrian's lowest (near-feet)
         points, which a single abs()-based threshold could still
@@ -189,7 +189,7 @@ def fuse_frame(camera_detections, lidar_clusters, radar_detections,
     raw_roi_points: the ROI-filtered but NOT ground-removed point
         cloud (see lidar_processing.filter_roi -- call it without
         remove_ground first). Only needed if any camera detections in
-        this frame are pothole/speed_bump; pass None or [] otherwise
+        this frame are pothole/speed_bumps; pass None or [] otherwise
         and normal classes are unaffected.
 
     Returns: list of dicts:
