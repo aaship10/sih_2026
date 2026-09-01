@@ -1,12 +1,25 @@
+import time
 import base64
 import logging
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("m3-downstream")
 
 app = FastAPI(title="M3 Dummy Downstream Server")
+
+
+@app.middleware("http")
+async def log_request_time(request: Request, call_next):
+    start_time = time.perf_counter()
+    response = await call_next(request)
+    process_time = time.perf_counter() - start_time
+    logger.info(
+        f"Request {request.method} {request.url.path} processed in {process_time * 1000:.2f} ms"
+    )
+    response.headers["X-Process-Time"] = str(process_time)
+    return response
 
 
 class FramePacket(BaseModel):
