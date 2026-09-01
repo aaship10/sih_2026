@@ -17,7 +17,7 @@ import httpx
 import numpy as np
 import torch
 import yaml
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import JSONResponse
 from ultralytics import YOLO
 
@@ -31,7 +31,7 @@ MODEL_PATH = Path(os.getenv("YOLO_MODEL_PATH", "best.pt"))
 CLASSES_PATH = Path(os.getenv("CLASSES_YAML_PATH", "classes.yaml"))
 WARMUP_IMAGE_PATH = Path(os.getenv("WARMUP_IMAGE_PATH", "test.jpg"))
 M3_DOWNSTREAM_URL = os.getenv(
-    "M3_DOWNSTREAM_URL", "http://localhost:9000/api/v1/downstream"
+    "M3_DOWNSTREAM_URL", "http://127.0.0.1:9000/api/v1/downstream"
 )
 M3_TIMEOUT_SECONDS = float(os.getenv("M3_TIMEOUT_SECONDS", "10"))
 YOLO_CONFIDENCE = float(os.getenv("YOLO_CONFIDENCE", "0.05"))
@@ -106,8 +106,6 @@ class PerceptionRuntime:
             raise RuntimeError(self.model_error or "YOLO model is unavailable")
 
         with self.inference_lock:
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
             results = self.model.predict(
                 source=image,
                 imgsz=YOLO_IMAGE_SIZE,
@@ -116,8 +114,6 @@ class PerceptionRuntime:
                 device=self.device,
                 verbose=False,
             )
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
 
         if not results or results[0].boxes is None:
             return []
@@ -199,22 +195,41 @@ async def forward_to_m3(
     radar_bytes: bytes,
 ) -> bool:
     """POST a FramePacket to M3; return false for any transport or HTTP failure."""
+    t_start = time.perf_counter()
+    
+    # Base64 encoding can be CPU intensive for large files
+    lidar_b64 = base64.b64encode(lidar_bytes).decode("ascii")
+    radar_b64 = base64.b64encode(radar_bytes).decode("ascii")
+    
+    t_encode = time.perf_counter()
+    
     payload = {
         "frame_id": frame_id,
         "timestamp": timestamp,
         "camera_detections": camera_detections,
-        "lidar_bytes_b64": base64.b64encode(lidar_bytes).decode("ascii"),
-        "radar_bytes_b64": base64.b64encode(radar_bytes).decode("ascii"),
+        "lidar_bytes_b64": lidar_b64,
+        "radar_bytes_b64": radar_b64,
         "lidar_size_bytes": len(lidar_bytes),
         "radar_size_bytes": len(radar_bytes),
         "lidar_encoding": "base64",
         "radar_encoding": "base64",
     }
+    
+    t_payload = time.perf_counter()
+
     try:
         LOGGER.info("Forwarding frame %s to M3: %s", frame_id, M3_DOWNSTREAM_URL)
-        timeout = httpx.Timeout(M3_TIMEOUT_SECONDS)
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            response = await client.post(M3_DOWNSTREAM_URL, json=payload)
+        response = await http_client.post(M3_DOWNSTREAM_URL, json=payload)
+            
+        t_request = time.perf_counter()
+        LOGGER.info(
+            "M3 forward breakdown: encode=%.2f ms, payload_build=%.2f ms, httpx_post=%.2f ms, total=%.2f ms",
+            (t_encode - t_start) * 1000.0,
+            (t_payload - t_encode) * 1000.0,
+            (t_request - t_payload) * 1000.0,
+            (t_request - t_start) * 1000.0,
+        )
+            
         if response.status_code != 200:
             LOGGER.warning("M3 returned HTTP %s: %s", response.status_code, response.text[:500])
             return False
@@ -225,10 +240,13 @@ async def forward_to_m3(
         return False
 
 
+http_client = httpx.AsyncClient(timeout=httpx.Timeout(M3_TIMEOUT_SECONDS))
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     await asyncio.to_thread(runtime.load)
     yield
+    await http_client.aclose()
 
 
 app = FastAPI(
@@ -236,6 +254,21 @@ app = FastAPI(
     version=os.getenv("APP_VERSION", "1.0.0"),
     lifespan=lifespan,
 )
+
+
+@app.middleware("http")
+async def log_request_time(request: Request, call_next):
+    start_time = time.perf_counter()
+    response = await call_next(request)
+    process_time = time.perf_counter() - start_time
+    LOGGER.info(
+        "Request %s %s processed in %.2f ms",
+        request.method,
+        request.url.path,
+        process_time * 1000.0,
+    )
+    response.headers["X-Process-Time"] = str(process_time)
+    return response
 
 
 @app.post("/api/v1/perception")
@@ -249,14 +282,17 @@ async def perception(
     radar_file: UploadFile = File(...),
 ) -> JSONResponse:
     """Receive M1 data, detect objects, forward FramePacket to M3, and acknowledge M1."""
+    t0 = time.perf_counter()
     del sensor_id, ego_speed_mps  # Accepted by the M1 contract; not part of FramePacket.
 
     image_bytes, lidar_bytes, radar_bytes = await asyncio.gather(
         image.read(), lidar_file.read(), radar_file.read()
     )
+    t1 = time.perf_counter()
+    
     decoded_image = decode_image(image_bytes)
+    t2 = time.perf_counter()
 
-    started = time.perf_counter()
     try:
         camera_detections = await asyncio.to_thread(
             runtime.predict_detections, decoded_image
@@ -266,6 +302,7 @@ async def perception(
     except Exception as exc:  # noqa: BLE001
         LOGGER.exception("Inference failed")
         raise HTTPException(status_code=500, detail="Camera inference failed") from exc
+    t3 = time.perf_counter()
 
     forwarded_to_m3 = await forward_to_m3(
         frame_id=frame_id,
@@ -274,12 +311,16 @@ async def perception(
         lidar_bytes=lidar_bytes,
         radar_bytes=radar_bytes,
     )
-    LOGGER.debug(
-        "Frame %s processed in %.2f ms; detections=%s; forwarded_to_m3=%s",
+    t4 = time.perf_counter()
+    
+    LOGGER.info(
+        "Frame %s breakdown: read_files=%.2f ms, decode_image=%.2f ms, inference=%.2f ms, forward_m3=%.2f ms, total=%.2f ms",
         frame_id,
-        (time.perf_counter() - started) * 1000.0,
-        len(camera_detections),
-        forwarded_to_m3,
+        (t1 - t0) * 1000.0,
+        (t2 - t1) * 1000.0,
+        (t3 - t2) * 1000.0,
+        (t4 - t3) * 1000.0,
+        (t4 - t0) * 1000.0,
     )
 
     return JSONResponse(
