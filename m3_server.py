@@ -115,15 +115,15 @@ LIDAR_POINT_STRIDE = int(os.getenv("LIDAR_POINT_STRIDE", "4"))
 
 # Radar: CARLA's RadarDetection struct order (velocity, azimuth, altitude, depth).
 # If radar results look wrong, try changing this order first.
-RADAR_COLUMN_ORDER = ("velocity", "azimuth", "altitude", "depth")
+RADAR_COLUMN_ORDER = ("velocity", "altitude", "azimuth", "depth")
 
 # Sensor mounting offsets relative to ego vehicle center (meters) --
 # MUST match your actual CARLA sensor spawn transforms in M1's setup.
 LIDAR_SENSOR_OFFSET = tuple(
-    float(v) for v in os.getenv("LIDAR_SENSOR_OFFSET", "0.0,0.0,1.8").split(",")
+    float(v) for v in os.getenv("LIDAR_SENSOR_OFFSET", "0.0,0.0,2.3").split(",")
 )
 RADAR_SENSOR_OFFSET = tuple(
-    float(v) for v in os.getenv("RADAR_SENSOR_OFFSET", "2.0,0.0,0.5").split(",")
+    float(v) for v in os.getenv("RADAR_SENSOR_OFFSET", "2.0,0.0,1.2").split(",")
 )
 
 CAMERA_INTRINSICS = make_default_camera_intrinsics(
@@ -133,7 +133,7 @@ CAMERA_INTRINSICS = make_default_camera_intrinsics(
 )
 CAMERA_EXTRINSICS = {
     "offset": tuple(
-        float(v) for v in os.getenv("CAMERA_SENSOR_OFFSET", "1.5,0.0,1.4").split(",")
+        float(v) for v in os.getenv("CAMERA_SENSOR_OFFSET", "1.5,0.0,2.2").split(",")
     )
 }
 
