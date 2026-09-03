@@ -13,8 +13,7 @@ What this file actually does, per incoming frame:
     2. Convert M2's camera_detections format -> M3's expected format
     3. Run the REAL M3 pipeline (unchanged files: lidar_processing.py,
        radar_processing.py, fusion.py, tracker.py) -> tracked_objects
-    4. Feed tracked_objects into the REAL M4 pipeline (same logic as
-       run_pipeline.py's M4 section) -> predictions
+    4. Feed tracked_objects into M4's multi-modal motion predictor -> predictions
     5. Return a small JSON summary to M2 (mirrors M2's own response style)
 
 IMPORTANT ASSUMPTIONS -- CONFIRM THESE WITH WHOEVER OWNS M1/CARLA:
@@ -43,14 +42,6 @@ to check -- see LIDAR_POINT_STRIDE and RADAR_COLUMN_ORDER below.
     transforms.sensor_to_ego() using the mounting offsets below.
     Update LIDAR_SENSOR_OFFSET / RADAR_SENSOR_OFFSET to match your
     actual sensor mounting position in your CARLA vehicle setup.
-
-  - M2 currently does NOT forward the ego vehicle's real position or
-    velocity (perception_server.py explicitly discards ego_speed_mps:
-    `del sensor_id, ego_speed_mps`). Until that's fixed on the M2
-    side, this file falls back to M4_Pipeline's generate_dummy_ego()
-    for ego_state, same as run_pipeline.py does. See
-    get_ego_state() below -- swapping in a real ego state later is a
-    one-line change once M2 forwards it.
 
 RUN THIS WITH:
     python m3_server.py
@@ -87,16 +78,16 @@ if M4_DIR not in sys.path:
     sys.path.insert(0, M4_DIR)
 
 # M3 imports -- unchanged files, exactly as tested in main.py
-from lidar_processing import process_lidar_frame, get_raw_roi_points
-from radar_processing import process_radar_frame, from_carla_format
-from fusion import fuse_frame
-from tracker import MultiObjectTracker
-from transforms import make_default_camera_intrinsics, sensor_to_ego
+from .lidar_processing import process_lidar_frame, get_raw_roi_points
+from .radar_processing import process_radar_frame, from_carla_format
+from .fusion import fuse_frame
+from .tracker import MultiObjectTracker
+from .transforms import make_default_camera_intrinsics, sensor_to_ego
 
-# M4 imports -- unchanged files, exactly as tested in run_pipeline.py
-from buffer import TrackHistoryBuffer
-from dummy_ego import generate_dummy_ego
-from interface import predict
+# M4 prediction imports
+from M4_Pipeline.buffer import TrackHistoryBuffer
+from M4_Pipeline.interface import predict
+from M4_Pipeline.m5_udp import M5UDPBroadcaster
 
 
 LOGGER = logging.getLogger("m3_server")
@@ -104,6 +95,11 @@ logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
+
+# M4 -> M5 UDP output broadcaster
+M5_UDP_HOST = os.getenv("M5_UDP_HOST", "127.0.0.1")
+M5_UDP_PORT = int(os.getenv("M5_UDP_PORT", "5004"))
+M5_UDP_HZ = float(os.getenv("M5_UDP_HZ", "10"))
 
 # ============================================================
 # 2. Configuration -- CONFIRM/ADJUST these against your actual
@@ -115,7 +111,7 @@ LIDAR_POINT_STRIDE = int(os.getenv("LIDAR_POINT_STRIDE", "4"))
 
 # Radar: CARLA's RadarDetection struct order (velocity, azimuth, altitude, depth).
 # If radar results look wrong, try changing this order first.
-RADAR_COLUMN_ORDER = ("velocity", "altitude", "azimuth", "depth")
+RADAR_COLUMN_ORDER = ("velocity", "azimuth", "altitude", "depth")
 
 # Sensor mounting offsets relative to ego vehicle center (meters) --
 # MUST match your actual CARLA sensor spawn transforms in M1's setup.
@@ -248,27 +244,15 @@ class M3Runtime:
             max_age_without_update=5,
         )
         self.history = TrackHistoryBuffer(max_len=HISTORY_MAX_LEN)
-        self.last_predictions: dict[int, dict] = {}
-        self.t0: float | None = None
         self.last_timestamp: float | None = None
         self.lock = threading.Lock()  # frames must be processed strictly in order
-
-    def get_ego_state(self, timestamp: float) -> dict[str, Any]:
-        """
-        Falls back to M4_Pipeline's dummy ego generator, since M2 does
-        not currently forward real ego position/velocity (see module
-        docstring). Swap this for a real ego_state once M2's
-        FramePacket includes one.
-        """
-        if self.t0 is None:
-            self.t0 = timestamp
-        ego_state = generate_dummy_ego(timestamp - self.t0)
-        ego_state["timestamp"] = round(timestamp, 2)
-        return ego_state
+        self.m5_broadcaster = M5UDPBroadcaster(
+            host=M5_UDP_HOST, port=M5_UDP_PORT, max_hz=M5_UDP_HZ
+        )
 
     def process_frame(self, frame_id: int, timestamp: float,
-                       camera_dets: list[dict], lidar_points: np.ndarray,
-                       radar_dets: list[dict]) -> dict[str, Any]:
+                  camera_dets: list[dict], lidar_points: np.ndarray,
+                  radar_dets: list[dict]) -> dict[str, Any]:
         with self.lock:
             dt = DT_FALLBACK
             if self.last_timestamp is not None:
@@ -291,10 +275,19 @@ class M3Runtime:
             # ---- M3: Tracking -> tracked_objects (UNCHANGED output format) ----
             tracked_objects = self.tracker.step(fused, dt=dt, timestamp=timestamp)
 
+            LOGGER.info(
+                "[PIPELINE][frame %s] "
+                "camera=%d | lidar=%d | radar=%d | fused=%d | tracked=%d",
+                frame_id,
+                len(camera_dets),
+                len(lidar_clusters),
+                len(radar_clean),
+                len(fused),
+                len(tracked_objects),
+            )
+
             # ---- M4: history + predictions (same logic as run_pipeline.py) ----
             self.history.update(tracked_objects)
-            ego_state = self.get_ego_state(timestamp)
-
             frame_predictions = []
             for obj in tracked_objects:
                 track_id = obj["track_id"]
@@ -305,11 +298,45 @@ class M3Runtime:
                     track_id=track_id,
                     cls=obj["class"],
                     track_history=track_history,
-                    ego_state=ego_state,
                     confidence=obj["confidence"],
                 )
                 frame_predictions.append(prediction)
-                self.last_predictions[track_id] = prediction
+                # LOGGER.info(
+                #     "[M4] frame %s | track=%s | class=%s | branches=%d",
+                #     frame_id,
+                #     prediction["track_id"],
+                #     prediction["class"],
+                #     len(prediction["trajectories"]),
+                # )
+
+                print(
+                    f"\n[M4] frame={frame_id} | "
+                    f"track={prediction['track_id']} | "
+                    f"class={prediction['class']} | "
+                    f"confidence={prediction['confidence']:.2f}"
+                )
+
+                print(
+                    f"     position=({prediction['position'][0]:.2f}, "
+                    f"{prediction['position'][1]:.2f}) | "
+                    f"velocity=({prediction['velocity'][0]:.2f}, "
+                    f"{prediction['velocity'][1]:.2f})"
+                )
+
+                for branch in prediction["trajectories"]:
+                    print(
+                        f"     {branch['mode']}: "
+                        f"probability={branch['probability']:.2f} | "
+                        f"points={len(branch['points'])} | "
+                        f"end=({branch['points'][-1]['x']:.2f}, "
+                        f"{branch['points'][-1]['y']:.2f})"
+                    )
+
+            # M4 -> M5: publish exactly the agreed prediction contract.
+            self.m5_broadcaster.send(
+                timestamp=timestamp,
+                predictions=frame_predictions,
+            )
 
             return {
                 "tracked_objects": tracked_objects,
@@ -328,20 +355,33 @@ runtime = M3Runtime()
 class FramePacket(BaseModel):
     frame_id: int
     timestamp: float
-    camera_detections: list = []
+
+    ego_speed_mps: float
+    ego_position: list[float]
+    ego_velocity: list[float]
+    ego_yaw_deg: float
+
+    camera_detections: list[dict[str, Any]]
     lidar_bytes_b64: str
     radar_bytes_b64: str
-    lidar_size_bytes: int = 0
-    radar_size_bytes: int = 0
-    lidar_encoding: str = "base64"
-    radar_encoding: str = "base64"
+    lidar_size_bytes: int
+    radar_size_bytes: int
+    lidar_encoding: str
+    radar_encoding: str
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    LOGGER.info("M3 server ready. LIDAR_SENSOR_OFFSET=%s RADAR_SENSOR_OFFSET=%s",
-                LIDAR_SENSOR_OFFSET, RADAR_SENSOR_OFFSET)
+    LOGGER.info(
+        "M3 server ready. LIDAR_SENSOR_OFFSET=%s RADAR_SENSOR_OFFSET=%s",
+        LIDAR_SENSOR_OFFSET, RADAR_SENSOR_OFFSET
+    )
+    LOGGER.info(
+        "M4 -> M5 UDP broadcaster ready at %s:%d (max %.1f Hz)",
+        M5_UDP_HOST, M5_UDP_PORT, M5_UDP_HZ
+    )
     yield
+    runtime.m5_broadcaster.close()
 
 
 app = FastAPI(title="M3 Fusion + Tracking Server", version="1.0.0", lifespan=lifespan)
@@ -367,7 +407,11 @@ async def receive_downstream_packet(packet: FramePacket) -> JSONResponse:
             packet.camera_detections, packet.timestamp, packet.frame_id
         )
         result = runtime.process_frame(
-            packet.frame_id, packet.timestamp, camera_dets, lidar_points, radar_dets
+            packet.frame_id,
+            packet.timestamp,
+            camera_dets,
+            lidar_points,
+            radar_dets,
         )
     except Exception as exc:  # noqa: BLE001
         LOGGER.exception("[frame %s] M3/M4 processing failed", packet.frame_id)
@@ -378,12 +422,22 @@ async def receive_downstream_packet(packet: FramePacket) -> JSONResponse:
         packet.frame_id, len(result["tracked_objects"]), len(result["predictions"]),
     )
 
+    # return JSONResponse(content={
+    #     "status": "received",
+    #     "frame_id": packet.frame_id,
+    #     "processed_detections": len(packet.camera_detections),
+    #     "tracked_objects_count": len(result["tracked_objects"]),
+    #     "predictions_count": len(result["predictions"]),
+    # })
+
     return JSONResponse(content={
-        "status": "received",
-        "frame_id": packet.frame_id,
-        "processed_detections": len(packet.camera_detections),
-        "tracked_objects_count": len(result["tracked_objects"]),
-        "predictions_count": len(result["predictions"]),
+    "status": "received",
+    "frame_id": packet.frame_id,
+    "processed_detections": len(packet.camera_detections),
+    "tracked_objects_count": len(result["tracked_objects"]),
+    "predictions_count": len(result["predictions"]),
+    "tracked_objects": result["tracked_objects"],
+    "predictions": result["predictions"],
     })
 
 
@@ -403,7 +457,7 @@ if __name__ == "__main__":
     import uvicorn
 
     uvicorn.run(
-        "m3_server:app",
+        "M3_Pipeline.m3_server:app",
         host=os.getenv("HOST", "0.0.0.0"),
         port=int(os.getenv("PORT", "9000")),
         workers=1,

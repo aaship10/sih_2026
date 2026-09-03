@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import asyncio
 import base64
 import logging
@@ -31,7 +32,8 @@ MODEL_PATH = Path(os.getenv("YOLO_MODEL_PATH", "best.pt"))
 CLASSES_PATH = Path(os.getenv("CLASSES_YAML_PATH", "classes.yaml"))
 WARMUP_IMAGE_PATH = Path(os.getenv("WARMUP_IMAGE_PATH", "test.jpg"))
 M3_DOWNSTREAM_URL = os.getenv(
-    "M3_DOWNSTREAM_URL", "http://127.0.0.1:9000/api/v1/downstream"
+    # "M3_DOWNSTREAM_URL", "http://127.0.0.1:9000/api/v1/downstream"
+    "M3_DOWNSTREAM_URL", "https://sellers-minerals-advise-fix.trycloudflare.com/api/v1/perception"
 )
 M3_TIMEOUT_SECONDS = float(os.getenv("M3_TIMEOUT_SECONDS", "10"))
 YOLO_CONFIDENCE = float(os.getenv("YOLO_CONFIDENCE", "0.05"))
@@ -187,13 +189,17 @@ def decode_image(image_bytes: bytes) -> np.ndarray:
 
 
 async def forward_to_m3(
-    *,
-    frame_id: int,
-    timestamp: float,
-    camera_detections: list[dict[str, Any]],
-    lidar_bytes: bytes,
-    radar_bytes: bytes,
-) -> bool:
+        *,
+        frame_id: int,
+        timestamp: float,
+        ego_speed_mps: float,
+        ego_position: list[float],
+        ego_velocity: list[float],
+        ego_yaw_deg: float,
+        camera_detections: list[dict[str, Any]],
+        lidar_bytes: bytes,
+        radar_bytes: bytes,
+    ) -> bool:
     """POST a FramePacket to M3; return false for any transport or HTTP failure."""
     t_start = time.perf_counter()
     
@@ -206,6 +212,10 @@ async def forward_to_m3(
     payload = {
         "frame_id": frame_id,
         "timestamp": timestamp,
+        "ego_speed_mps": ego_speed_mps,
+        "ego_position": ego_position,
+        "ego_velocity": ego_velocity,
+        "ego_yaw_deg": ego_yaw_deg,
         "camera_detections": camera_detections,
         "lidar_bytes_b64": lidar_b64,
         "radar_bytes_b64": radar_b64,
@@ -277,13 +287,19 @@ async def perception(
     frame_id: int = Form(...),
     timestamp: float = Form(...),
     ego_speed_mps: float = Form(...),
+    ego_position: str = Form(...),
+    ego_velocity: str = Form(...),
+    ego_yaw_deg: float = Form(...),
     image: UploadFile = File(...),
     lidar_file: UploadFile = File(...),
     radar_file: UploadFile = File(...),
 ) -> JSONResponse:
     """Receive M1 data, detect objects, forward FramePacket to M3, and acknowledge M1."""
     t0 = time.perf_counter()
-    del sensor_id, ego_speed_mps  # Accepted by the M1 contract; not part of FramePacket.
+    del sensor_id  # Accepted by the M1 contract; not part of FramePacket.
+
+    ego_position_data = json.loads(ego_position)
+    ego_velocity_data = json.loads(ego_velocity)
 
     image_bytes, lidar_bytes, radar_bytes = await asyncio.gather(
         image.read(), lidar_file.read(), radar_file.read()
@@ -297,6 +313,14 @@ async def perception(
         camera_detections = await asyncio.to_thread(
             runtime.predict_detections, decoded_image
         )
+
+        # Log the number of detections for this frame (DEBUGGING)
+        LOGGER.info(
+            "[M2] frame=%s | detections=%d",
+            frame_id,
+            len(camera_detections),
+        )
+
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     except Exception as exc:  # noqa: BLE001
@@ -307,6 +331,10 @@ async def perception(
     forwarded_to_m3 = await forward_to_m3(
         frame_id=frame_id,
         timestamp=timestamp,
+        ego_speed_mps=ego_speed_mps,
+        ego_position=ego_position_data,
+        ego_velocity=ego_velocity_data,
+        ego_yaw_deg=ego_yaw_deg,
         camera_detections=camera_detections,
         lidar_bytes=lidar_bytes,
         radar_bytes=radar_bytes,

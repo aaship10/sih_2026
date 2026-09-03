@@ -17,7 +17,7 @@ Branches produced (mode names match Section 13's example):
 
 WEIGHTING:
     stop_probability and crossing_weight_base come straight from the
-    class's CLASS_PARAMS entry (Section 12's per-class behavior).
+    class's CLASS_PARAMS entry.
     crossing_weight_base is then boosted when derive.py's
     estimate_lateral_velocity_trend() shows this object's sideways
     speed picking up RIGHT NOW -- the concrete "if lateral velocity
@@ -39,7 +39,7 @@ STATIC_CLASSES = {
     "static_obstacle",
 }
 
-from motion_models import (
+from .motion_models import (
     get_class_params,
     constant_velocity_rollout,
     lateral_deviation_rollout,

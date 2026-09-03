@@ -19,6 +19,7 @@ Files:
 
 from __future__ import annotations
 
+import json
 import argparse
 import csv
 import math
@@ -101,9 +102,11 @@ class M2Uploader:
         self.sent = 0
         self.failed = 0
         self.dropped = 0
+        self.submitted = 0
         self._thread.start()
 
     def submit(self, packet: dict[str, Any]) -> bool:
+        self.submitted += 1
         try:
             self._queue.put_nowait(packet)
             return True
@@ -150,7 +153,12 @@ class M2Uploader:
                     "sensor_id": packet["sensor_id"],
                     "frame_id": str(frame_id),
                     "timestamp": repr(packet["timestamp"]),
+
                     "ego_speed_mps": repr(packet["ego_speed_mps"]),
+
+                    "ego_position": json.dumps(packet["ego_position"]),
+                    "ego_velocity": json.dumps(packet["ego_velocity"]),
+                    "ego_yaw_deg": repr(packet["ego_yaw_deg"]),
                 }
                 try:
                     response = client.post(self.url, data=data, files=files)
@@ -176,6 +184,11 @@ class Scenario1VillageRoad:
         self.lidar_frames = FrameSensorBuffer("LiDAR")
         self.radar_frames = FrameSensorBuffer("radar")
         self.uploader: M2Uploader | None = None
+
+        # Track dropped frames for debugging purposes
+        self.sensor_dropped = 0
+        self.queue_dropped = 0
+
         self.collision_events: list[dict[str, Any]] = []
         self._collision_keys: set[tuple[int, int]] = set()
         self.trajectory_log: list[dict[str, Any]] = []
@@ -269,24 +282,94 @@ class Scenario1VillageRoad:
             raise RuntimeError("Could not encode CARLA RGB image as PNG")
         return encoded.tobytes()
 
+    # def _collect_and_send(self, carla_frame: int, snapshot) -> None:
+    #     try:
+    #         image = self.rgb_frames.get(carla_frame, SENSOR_WAIT_SECONDS)
+    #         lidar = self.lidar_frames.get(carla_frame, SENSOR_WAIT_SECONDS)
+    #         radar = self.radar_frames.get(carla_frame, SENSOR_WAIT_SECONDS)
+    #         packet = {
+    #             "sensor_id": SENSOR_ID,
+    #             "frame_id": int(carla_frame),
+    #             "timestamp": float(snapshot.timestamp.elapsed_seconds),
+    #             "ego_speed_mps": self._ego_speed_mps(),
+    #             "image": self._encode_png(image),
+    #             "lidar": lidar,
+    #             "radar": radar,
+    #         }
+    #         if self.uploader and not self.uploader.submit(packet):
+    #             print(f"[M2][WARN] frame {carla_frame} could not be queued", flush=True)
+    #     except TimeoutError as exc:
+    #         print(f"[SENSOR][WARN] {exc}", flush=True)
+
     def _collect_and_send(self, carla_frame: int, snapshot) -> None:
-        try:
-            image = self.rgb_frames.get(carla_frame, SENSOR_WAIT_SECONDS)
-            lidar = self.lidar_frames.get(carla_frame, SENSOR_WAIT_SECONDS)
-            radar = self.radar_frames.get(carla_frame, SENSOR_WAIT_SECONDS)
-            packet = {
-                "sensor_id": SENSOR_ID,
-                "frame_id": int(carla_frame),
-                "timestamp": float(snapshot.timestamp.elapsed_seconds),
-                "ego_speed_mps": self._ego_speed_mps(),
-                "image": self._encode_png(image),
-                "lidar": lidar,
-                "radar": radar,
-            }
-            if self.uploader and not self.uploader.submit(packet):
-                print(f"[M2][WARN] frame {carla_frame} could not be queued", flush=True)
-        except TimeoutError as exc:
-            print(f"[SENSOR][WARN] {exc}", flush=True)
+            try:
+                image = self.rgb_frames.get(carla_frame, SENSOR_WAIT_SECONDS)
+                lidar = self.lidar_frames.get(carla_frame, SENSOR_WAIT_SECONDS)
+                radar = self.radar_frames.get(carla_frame, SENSOR_WAIT_SECONDS)
+
+                image_bytes = self._encode_png(image)
+
+                print(
+                    f"[PACKET][frame {carla_frame}] "
+                    f"RGB_PNG={len(image_bytes)} bytes | "
+                    f"LiDAR={len(lidar)} bytes | "
+                    f"Radar={len(radar)} bytes",
+                    flush=True,
+                )
+
+                # packet = {
+                #     "sensor_id": SENSOR_ID,
+                #     "frame_id": int(carla_frame),
+                #     "timestamp": float(snapshot.timestamp.elapsed_seconds),
+                #     "ego_speed_mps": self._ego_speed_mps(),
+                #     "image": image_bytes,
+                #     "lidar": lidar,
+                #     "radar": radar,
+                # }
+
+                ego_transform = self.ego.get_transform()
+                ego_velocity = self.ego.get_velocity()
+                ego_location = self.ego.get_location()
+
+                packet = {
+                    "sensor_id": SENSOR_ID,
+                    "frame_id": int(carla_frame),
+                    "timestamp": float(snapshot.timestamp.elapsed_seconds),
+
+                    "ego_speed_mps": self._ego_speed_mps(),
+
+                    "ego_position": [
+                        float(ego_location.x),
+                        float(ego_location.y),
+                        float(ego_location.z),
+                    ],
+
+                    "ego_velocity": [
+                        float(ego_velocity.x),
+                        float(ego_velocity.y),
+                        float(ego_velocity.z),
+                    ],
+
+                    "ego_yaw_deg": float(ego_transform.rotation.yaw),
+
+                    "image": image_bytes,
+                    "lidar": lidar,
+                    "radar": radar,
+                }
+
+                if self.uploader and not self.uploader.submit(packet):
+                    self.queue_dropped += 1
+                    print(
+                        f"[QUEUE][DROP] frame {carla_frame} could not be queued",
+                        flush=True,
+                    )
+
+            except TimeoutError as exc:
+                self.sensor_dropped += 1
+                print(
+                    f"[SENSOR][DROP] frame {carla_frame}: {exc}",
+                    flush=True,
+                )
 
     def _ego_speed_mps(self) -> float:
         velocity = self.ego.get_velocity()
@@ -324,7 +407,17 @@ class Scenario1VillageRoad:
             writer = csv.DictWriter(f, fieldnames=["frame", "t", "x", "y", "z"]); writer.writeheader(); writer.writerows(self.trajectory_log)
         if self.uploader:
             self.uploader.close()
-            print(f"[M2] final sent={self.uploader.sent} failed={self.uploader.failed} dropped={self.uploader.dropped}", flush=True)
+            print(
+                f"[M2] final submitted={self.uploader.submitted} "
+                f"sent={self.uploader.sent} "
+                f"failed={self.uploader.failed} "
+                f"dropped={self.uploader.dropped}"
+            )
+            print(
+                f"[M1] sensor_dropped={self.sensor_dropped} "
+                f"queue_dropped={self.queue_dropped}",
+                flush=True,
+            )
         if self.world:
             try:
                 settings = self.world.get_settings(); settings.synchronous_mode = False; self.world.apply_settings(settings)
