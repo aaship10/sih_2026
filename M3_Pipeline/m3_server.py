@@ -250,9 +250,18 @@ class M3Runtime:
             host=M5_UDP_HOST, port=M5_UDP_PORT, max_hz=M5_UDP_HZ
         )
 
-    def process_frame(self, frame_id: int, timestamp: float,
-                  camera_dets: list[dict], lidar_points: np.ndarray,
-                  radar_dets: list[dict]) -> dict[str, Any]:
+    def process_frame(
+        self,
+        frame_id: int,
+        timestamp: float,
+        ego_speed_mps: float,
+        ego_position: list[float],
+        ego_velocity: list[float],
+        ego_yaw_deg: float,
+        camera_dets: list[dict],
+        lidar_points: np.ndarray,
+        radar_dets: list[dict],
+    ) -> dict[str, Any]:
         with self.lock:
             dt = DT_FALLBACK
             if self.last_timestamp is not None:
@@ -336,6 +345,10 @@ class M3Runtime:
             self.m5_broadcaster.send(
                 timestamp=timestamp,
                 predictions=frame_predictions,
+                ego_speed_mps=ego_speed_mps,
+                ego_position=ego_position,
+                ego_velocity=ego_velocity,
+                ego_yaw_deg=ego_yaw_deg,
             )
 
             return {
@@ -409,6 +422,10 @@ async def receive_downstream_packet(packet: FramePacket) -> JSONResponse:
         result = runtime.process_frame(
             packet.frame_id,
             packet.timestamp,
+            packet.ego_speed_mps,
+            packet.ego_position,
+            packet.ego_velocity,
+            packet.ego_yaw_deg,
             camera_dets,
             lidar_points,
             radar_dets,

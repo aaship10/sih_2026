@@ -8,3 +8,5 @@ slprj/
 __pycache__/
 venv/
 
+# Generated CARLA logs
+Carla_M1/logs/*.csv

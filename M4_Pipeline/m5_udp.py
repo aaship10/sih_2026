@@ -70,6 +70,10 @@ class M5UDPBroadcaster:
         self,
         timestamp: float,
         predictions: list[dict[str, Any]],
+        ego_speed_mps: float,
+        ego_position: list[float],
+        ego_velocity: list[float],
+        ego_yaw_deg: float,
     ) -> dict[str, Any]:
         obstacles = []
         for prediction in predictions:
@@ -106,6 +110,18 @@ class M5UDPBroadcaster:
 
         return {
             "timestamp": self._round(timestamp, 3),
+            "ego": {
+                "speed_mps": self._round(ego_speed_mps),
+                "position": [
+                    self._round(ego_position[0]),
+                    self._round(ego_position[1]),
+                ],
+                "velocity": [
+                    self._round(ego_velocity[0]),
+                    self._round(ego_velocity[1]),
+                ],
+                "yaw_deg": self._round(ego_yaw_deg),
+            },
             "obstacles": obstacles,
         }
 
@@ -113,6 +129,10 @@ class M5UDPBroadcaster:
         self,
         timestamp: float,
         predictions: list[dict[str, Any]],
+        ego_speed_mps: float,
+        ego_position: list[float],
+        ego_velocity: list[float],
+        ego_yaw_deg: float,
     ) -> bool:
         """Send the latest M4 frame unless rate-limited."""
         now = time.monotonic()
@@ -122,7 +142,14 @@ class M5UDPBroadcaster:
                 return False
             self._last_send_monotonic = now
 
-        packet = self._build_packet(timestamp, predictions)
+        packet = self._build_packet(
+            timestamp,
+            predictions,
+            ego_speed_mps,
+            ego_position,
+            ego_velocity,
+            ego_yaw_deg,
+        )
         payload = json.dumps(
             packet, separators=(",", ":"), ensure_ascii=False
         ).encode("utf-8")
