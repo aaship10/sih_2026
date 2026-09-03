@@ -28,12 +28,12 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
 
-MODEL_PATH = Path(os.getenv("YOLO_MODEL_PATH", "best.pt"))
-CLASSES_PATH = Path(os.getenv("CLASSES_YAML_PATH", "classes.yaml"))
-WARMUP_IMAGE_PATH = Path(os.getenv("WARMUP_IMAGE_PATH", "test.jpg"))
+BASE_DIR = Path(__file__).resolve().parent
+MODEL_PATH = Path(os.getenv("YOLO_MODEL_PATH", BASE_DIR / "best.pt"))
+CLASSES_PATH = Path(os.getenv("CLASSES_YAML_PATH", BASE_DIR / "classes.yaml"))
+WARMUP_IMAGE_PATH = Path(os.getenv("WARMUP_IMAGE_PATH", BASE_DIR / "test.jpg"))
 M3_DOWNSTREAM_URL = os.getenv(
-    # "M3_DOWNSTREAM_URL", "http://127.0.0.1:9000/api/v1/downstream"
-    "M3_DOWNSTREAM_URL", "https://sellers-minerals-advise-fix.trycloudflare.com/api/v1/perception"
+    "M3_DOWNSTREAM_URL", "http://127.0.0.1:9000/api/v1/downstream"
 )
 M3_TIMEOUT_SECONDS = float(os.getenv("M3_TIMEOUT_SECONDS", "10"))
 YOLO_CONFIDENCE = float(os.getenv("YOLO_CONFIDENCE", "0.05"))

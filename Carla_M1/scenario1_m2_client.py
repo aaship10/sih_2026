@@ -38,7 +38,7 @@ import numpy as np
 TOWN = "Town07"
 FIXED_DELTA_SECONDS = 0.05
 LOG_DIR = Path("logs")
-M2_URL = "http://127.0.0.1:8000/api/v1/perception"
+M2_URL = "https://tube-media-attractions-announced.trycloudflare.com/api/v1/perception"
 M2_TIMEOUT_SECONDS = 5.0
 TRAFFIC_MANAGER_PORT = 8001  # M2 uses port 8000, so do not use CARLA's default TM port.
 SENSOR_WAIT_SECONDS = 2.0
@@ -390,7 +390,10 @@ class Scenario1VillageRoad:
         snapshot = self.world.get_snapshot()
         ego_loc = self.ego.get_location()
         self.trajectory_log.append({"frame": carla_frame, "t": snapshot.timestamp.elapsed_seconds, "x": ego_loc.x, "y": ego_loc.y, "z": ego_loc.z})
-        self._collect_and_send(carla_frame, snapshot)
+        
+        if self.frame_count % 2 == 0:
+            self._collect_and_send(carla_frame, snapshot)
+
         if self.pedestrian and not self.pedestrian_triggered and ego_loc.distance(self.pedestrian.get_location()) < PEDESTRIAN_TRIGGER_DISTANCE_M:
             self._trigger_pedestrian()
         if self.cattle and not self.cattle_triggered and ego_loc.distance(self.cattle.get_location()) < CATTLE_TRIGGER_DISTANCE_M:
