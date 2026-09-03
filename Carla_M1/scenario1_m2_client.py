@@ -39,6 +39,7 @@ TOWN = "Town07"
 FIXED_DELTA_SECONDS = 0.05
 LOG_DIR = Path("logs")
 M2_URL = "http://127.0.0.1:8000/api/v1/perception"
+# M2_URL = "https://tube-media-attractions-announced.trycloudflare.com/api/v1/perception"
 M2_TIMEOUT_SECONDS = 5.0
 TRAFFIC_MANAGER_PORT = 8001  # M2 uses port 8000, so do not use CARLA's default TM port.
 SENSOR_WAIT_SECONDS = 2.0
@@ -282,25 +283,6 @@ class Scenario1VillageRoad:
             raise RuntimeError("Could not encode CARLA RGB image as PNG")
         return encoded.tobytes()
 
-    # def _collect_and_send(self, carla_frame: int, snapshot) -> None:
-    #     try:
-    #         image = self.rgb_frames.get(carla_frame, SENSOR_WAIT_SECONDS)
-    #         lidar = self.lidar_frames.get(carla_frame, SENSOR_WAIT_SECONDS)
-    #         radar = self.radar_frames.get(carla_frame, SENSOR_WAIT_SECONDS)
-    #         packet = {
-    #             "sensor_id": SENSOR_ID,
-    #             "frame_id": int(carla_frame),
-    #             "timestamp": float(snapshot.timestamp.elapsed_seconds),
-    #             "ego_speed_mps": self._ego_speed_mps(),
-    #             "image": self._encode_png(image),
-    #             "lidar": lidar,
-    #             "radar": radar,
-    #         }
-    #         if self.uploader and not self.uploader.submit(packet):
-    #             print(f"[M2][WARN] frame {carla_frame} could not be queued", flush=True)
-    #     except TimeoutError as exc:
-    #         print(f"[SENSOR][WARN] {exc}", flush=True)
-
     def _collect_and_send(self, carla_frame: int, snapshot) -> None:
             try:
                 image = self.rgb_frames.get(carla_frame, SENSOR_WAIT_SECONDS)
@@ -316,17 +298,7 @@ class Scenario1VillageRoad:
                     f"Radar={len(radar)} bytes",
                     flush=True,
                 )
-
-                # packet = {
-                #     "sensor_id": SENSOR_ID,
-                #     "frame_id": int(carla_frame),
-                #     "timestamp": float(snapshot.timestamp.elapsed_seconds),
-                #     "ego_speed_mps": self._ego_speed_mps(),
-                #     "image": image_bytes,
-                #     "lidar": lidar,
-                #     "radar": radar,
-                # }
-
+                
                 ego_transform = self.ego.get_transform()
                 ego_velocity = self.ego.get_velocity()
                 ego_location = self.ego.get_location()
