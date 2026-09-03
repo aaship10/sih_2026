@@ -280,6 +280,9 @@ async def log_request_time(request: Request, call_next):
     response.headers["X-Process-Time"] = str(process_time)
     return response
 
+@app.get("/")
+async def root():
+    return {"message": "M2 Perception Server is running", "docs": "/docs", "health": "/health"}
 
 @app.post("/api/v1/perception")
 async def perception(
