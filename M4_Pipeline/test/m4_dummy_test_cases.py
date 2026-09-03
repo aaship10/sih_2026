@@ -13,27 +13,19 @@ Each test case is a dict:
                            per-object output format,
         "history": a list of that SAME object's past few frames
                    (oldest -> newest) -- also exactly M3's format,
-        "ego_state": the car's own current position/velocity
-    }
+        }
 
 HOW TO USE THIS:
     from m4_dummy_test_cases import ALL_TEST_CASES
 
     for case in ALL_TEST_CASES:
-        result = my_predict_function(case["tracked_object"], case["history"], case["ego_state"])
+        result = my_predict_function(case["tracked_object"], case["history"])
         print(case["name"])
         print(result)
 
 Coordinate frame (matches M3's output): x = forward (meters),
 y = left/right (meters, positive = left), all in the ego (car) frame.
 """
-
-EGO_STATE = {
-    "position": [0.0, 0.0],
-    "velocity": [12.0, 0.0],
-    "heading": 0.0,
-    "timestamp": 10.0,
-}
 
 
 # ---------------------------------------------------------------------
@@ -54,7 +46,6 @@ TEST_1_CONSTANT_VELOCITY_CAR = {
         {"timestamp": 10.6, "position": [39.76, -3.5], "velocity": [8.0, 0.0]},
         {"timestamp": 10.8, "position": [40.0, -3.5], "velocity": [8.0, 0.0]},
     ],
-    "ego_state": EGO_STATE,
 }
 
 
@@ -76,7 +67,6 @@ TEST_2_ACCELERATING_VEHICLE = {
         {"timestamp": 10.6, "position": [28.36, -3.5], "velocity": [6.2, 0.0]},
         {"timestamp": 10.8, "position": [29.64, -3.5], "velocity": [6.6, 0.0]},
     ],
-    "ego_state": EGO_STATE,
 }
 
 
@@ -98,7 +88,6 @@ TEST_3_DECELERATING_VEHICLE = {
         {"timestamp": 10.6, "position": [24.74, 0.0], "velocity": [8.2, 0.0]},
         {"timestamp": 10.8, "position": [25.6, 0.0], "velocity": [7.6, 0.0]},
     ],
-    "ego_state": EGO_STATE,
 }
 
 
@@ -120,7 +109,6 @@ TEST_4_PEDESTRIAN_CROSSING = {
         {"timestamp": 10.6, "position": [15.1, 2.4], "velocity": [0.3, -2.8]},
         {"timestamp": 10.8, "position": [15.2, 1.8], "velocity": [0.5, -3.0]},
     ],
-    "ego_state": EGO_STATE,
 }
 
 
@@ -142,7 +130,6 @@ TEST_5_MOTORCYCLE_LATERAL = {
         {"timestamp": 10.6, "position": [19.0, -3.2], "velocity": [15.0, 3.0]},
         {"timestamp": 10.8, "position": [22.0, -2.6], "velocity": [15.0, 3.0]},
     ],
-    "ego_state": EGO_STATE,
 }
 
 
@@ -165,7 +152,6 @@ TEST_6_AUTORICKSHAW_DIRECTION_CHANGE = {
         {"timestamp": 10.8, "position": [27.4, -3.0], "velocity": [9.0, 3.5]},
         {"timestamp": 11.0, "position": [28.8, -2.0], "velocity": [8.5, 4.5]},
     ],
-    "ego_state": EGO_STATE,
 }
 
 
@@ -187,7 +173,6 @@ TEST_7_ANIMAL_ERRATIC = {
         {"timestamp": 10.6, "position": [17.2, 2.6], "velocity": [2.0, -4.0]},
         {"timestamp": 10.8, "position": [17.6, 1.8], "velocity": [-1.0, -4.2]},
     ],
-    "ego_state": EGO_STATE,
 }
 
 
@@ -210,7 +195,6 @@ TEST_8_VEHICLE_MERGING = {
         {"timestamp": 10.8, "position": [10.6, -2.2], "velocity": [12.0, 2.0]},
         {"timestamp": 11.0, "position": [11.0, -1.8], "velocity": [12.0, 2.0]},
     ],
-    "ego_state": EGO_STATE,
 }
 
 
@@ -231,7 +215,6 @@ TEST_9_INTERSECTION_AGENT_A = {
         {"timestamp": 10.4, "position": [5.0, 4.0], "velocity": [0.0, -10.0]},
         {"timestamp": 10.6, "position": [5.0, 2.0], "velocity": [0.0, -10.0]},
     ],
-    "ego_state": EGO_STATE,
 }
 
 TEST_9_INTERSECTION_AGENT_B = {
@@ -248,7 +231,6 @@ TEST_9_INTERSECTION_AGENT_B = {
         {"timestamp": 10.4, "position": [7.0, -6.0], "velocity": [10.0, 0.0]},
         {"timestamp": 10.6, "position": [9.0, -6.0], "velocity": [10.0, 0.0]},
     ],
-    "ego_state": EGO_STATE,
 }
 
 
@@ -266,7 +248,6 @@ TEST_10_SUDDEN_APPEARANCE = {
     "history": [
         {"timestamp": 10.0, "position": [12.0, -1.0], "velocity": [0.0, 0.0]},
     ],
-    "ego_state": EGO_STATE,
 }
 
 
@@ -282,7 +263,6 @@ TEST_11_EMPTY_HISTORY = {
         "confidence": 0.5, "timestamp": 10.0,
     },
     "history": [],
-    "ego_state": EGO_STATE,
 }
 
 
