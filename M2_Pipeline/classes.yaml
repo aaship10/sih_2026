@@ -1,0 +1,45 @@
+# M2 Camera Perception — Canonical Class Taxonomy
+#
+# This file is the single authoritative source for the 14-class object taxonomy
+# used by the M2 YOLO detector.
+#
+# IMPORTANT: This list exists for documentation and validation purposes only.
+# At runtime, model.names (read directly from the loaded .pt file) is the
+# authoritative class-index → class-name mapping.
+#
+# If model.names conflicts with this list, the conflict MUST be reported
+# rather than silently resolving it. Do not rename or reorder classes here
+# to paper over a training mismatch.
+#
+# Class descriptions (to prevent label ambiguity during dataset preparation):
+#   pedestrian     - Walking/standing persons
+#   bicycle        - Human-pedalled bicycles
+#   car            - Passenger cars, SUVs, taxis, jeeps
+#   motorcycle     - Motorcycles, scooters, mopeds
+#   bus            - Full-sized buses, mini-buses, school buses
+#   tempo          - Light commercial vehicles, tempos, load carriers
+#   truck          - Goods vehicles, lorries, pickup trucks
+#   road_sign      - Any road sign (generic detection only — no sign-meaning
+#                    classification inside M2)
+#   traffic_signal - Traffic lights / signals controlling road traffic
+#   rickshaw       - Three-wheeled motorized or human-powered rickshaws
+#   speed_bumps    - Speed humps / sleeping policemen
+#   traffic_cones  - Traffic cones / safety cones for road redirection
+#   animal         - Cows, dogs, goats, or other animals on or near the road
+#   pothole        - Potholes in road surface
+
+names:
+  - pedestrian
+  - bicycle
+  - car
+  - motorcycle
+  - bus
+  - tempo
+  - truck
+  - road_sign
+  - traffic_signal
+  - rickshaw
+  - speed_bumps
+  - traffic_cones
+  - animal
+  - pothole
