@@ -1,0 +1,13 @@
+fastapi
+uvicorn[standard]
+python-multipart
+opencv-python-headless
+numpy
+pyyaml
+ultralytics
+ 
+# IMPORTANT: install a CUDA-enabled torch build BEFORE installing the above,
+# or ultralytics may pull in the CPU-only version instead. Get the exact
+# command for your CUDA version from https://pytorch.org/get-started/locally/
+# Example (CUDA 12.1):
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
