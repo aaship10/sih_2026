@@ -1,94 +1,39 @@
+"""M3 server: sensor fusion + object tracking.
+
+Receives the FramePacket M2 already forwards to `M3_DOWNSTREAM_URL`
+(http://127.0.0.1:9000/api/v1/downstream by default -- see
+M2_Pipeline/perception_server.py). This is a drop-in replacement for
+M2_Pipeline/M3_dummy_server.py: same URL/port/endpoint contract, but it
+actually runs the pipeline -- LiDAR/radar decoding -> sensor fusion ->
+multi-object tracking -> tracked_objects -- instead of just logging byte
+counts. Output is forwarded (best-effort, mirroring M2's own forwarding
+pattern to M3) to M4 and logged to logs/m3_tracks.jsonl for evaluation and
+offline visualization (see evaluation.py, visualize_tracks.py).
+
+Run from inside this directory: `python m3_server.py` (listens on port 9000).
 """
-m3_server.py
-=============
-The REAL M3 downstream server -- replaces M3_dummy_server.py.
-
-Receives the exact same FramePacket that perception_server.py (M2)
-already POSTs to http://localhost:9000/api/v1/downstream, so
-**M2's code needs ZERO changes** -- this is a drop-in replacement for
-the dummy stub.
-
-What this file actually does, per incoming frame:
-    1. Decode base64 lidar/radar bytes -> numpy arrays
-    2. Convert M2's camera_detections format -> M3's expected format
-    3. Run the REAL M3 pipeline (unchanged files: lidar_processing.py,
-       radar_processing.py, fusion.py, tracker.py) -> tracked_objects
-    4. Feed tracked_objects into M4's multi-modal motion predictor -> predictions
-    5. Return a small JSON summary to M2 (mirrors M2's own response style)
-
-IMPORTANT ASSUMPTIONS -- CONFIRM THESE WITH WHOEVER OWNS M1/CARLA:
---------------------------------------------------------------------
-This file cannot see M1's actual sensor-capture code, so the exact
-byte layout of lidar_bytes/radar_bytes is an assumption based on
-CARLA's standard sensor output format. If frames get processed with
-zero detections or obviously wrong positions, THIS is the first place
-to check -- see LIDAR_POINT_STRIDE and RADAR_COLUMN_ORDER below.
-
-  - LiDAR bytes: assumed to be CARLA's standard
-    `sensor.lidar.ray_cast` raw_data -- a flat float32 buffer,
-    4 values per point (x, y, z, intensity). This is CARLA's default
-    LiDAR format and is very likely correct as-is.
-
-  - Radar bytes: assumed to be CARLA's standard `sensor.other.radar`
-    raw_data -- a flat float32 buffer, 4 values per detection, in the
-    order (velocity, azimuth, altitude, depth) per CARLA's
-    RadarDetection struct layout. Radar column order varies more
-    across CARLA versions/community code than LiDAR does -- if radar
-    positions/velocities look wrong, try reordering
-    RADAR_COLUMN_ORDER below first.
-
-  - Both are assumed to be in each SENSOR's own local frame (as CARLA
-    hands them to a `sensor.listen()` callback), so this file applies
-    transforms.sensor_to_ego() using the mounting offsets below.
-    Update LIDAR_SENSOR_OFFSET / RADAR_SENSOR_OFFSET to match your
-    actual sensor mounting position in your CARLA vehicle setup.
-
-RUN THIS WITH:
-    python m3_server.py
-(listens on port 9000, same as M3_dummy_server.py, so M2's
-M3_DOWNSTREAM_URL doesn't need to change)
-"""
-
 from __future__ import annotations
 
+import asyncio
 import base64
+import json
 import logging
 import os
-import sys
-import threading
+import time
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Any
 
+import httpx
 import numpy as np
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-# ============================================================
-# 1. Make both M3 root and M4_Pipeline imports available
-#    (same pattern as run_pipeline.py)
-# ============================================================
-
-ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
-M4_DIR = os.path.join(ROOT_DIR, "M4_Pipeline")
-
-if ROOT_DIR not in sys.path:
-    sys.path.insert(0, ROOT_DIR)
-if M4_DIR not in sys.path:
-    sys.path.insert(0, M4_DIR)
-
-# M3 imports -- unchanged files, exactly as tested in main.py
-from .lidar_processing import process_lidar_frame, get_raw_roi_points
-from .radar_processing import process_radar_frame, from_carla_format
-from .fusion import fuse_frame
-from .tracker import MultiObjectTracker
-from .transforms import make_default_camera_intrinsics, sensor_to_ego
-
-# M4 prediction imports
-from M4_Pipeline.buffer import TrackHistoryBuffer
-from M4_Pipeline.interface import predict
-from M4_Pipeline.m5_udp import M5UDPBroadcaster
-
+import config
+import sensor_fusion
+from coordinate_transforms import ego_to_world, world_to_ego
+from tracker import Tracker
 
 LOGGER = logging.getLogger("m3_server")
 logging.basicConfig(
@@ -96,377 +41,248 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
 
-# M4 -> M5 UDP output broadcaster
-M5_UDP_HOST = os.getenv("M5_UDP_HOST", "127.0.0.1")
-M5_UDP_PORT = int(os.getenv("M5_UDP_PORT", "5004"))
-M5_UDP_HZ = float(os.getenv("M5_UDP_HZ", "10"))
+M4_DOWNSTREAM_URL = os.getenv("M4_DOWNSTREAM_URL", config.M4_DOWNSTREAM_URL)
+M4_TIMEOUT_SECONDS = float(os.getenv("M4_TIMEOUT_SECONDS", str(config.M4_TIMEOUT_SECONDS)))
 
-# ============================================================
-# 2. Configuration -- CONFIRM/ADJUST these against your actual
-#    CARLA sensor setup (see module docstring above)
-# ============================================================
-
-# LiDAR: CARLA's ray_cast LiDAR gives (x, y, z, intensity) per point
-LIDAR_POINT_STRIDE = int(os.getenv("LIDAR_POINT_STRIDE", "4"))
-
-# Radar: CARLA's RadarDetection struct order (velocity, azimuth, altitude, depth).
-# If radar results look wrong, try changing this order first.
-RADAR_COLUMN_ORDER = ("velocity", "azimuth", "altitude", "depth")
-
-# Sensor mounting offsets relative to ego vehicle center (meters) --
-# MUST match your actual CARLA sensor spawn transforms in M1's setup.
-LIDAR_SENSOR_OFFSET = tuple(
-    float(v) for v in os.getenv("LIDAR_SENSOR_OFFSET", "0.0,0.0,2.3").split(",")
-)
-RADAR_SENSOR_OFFSET = tuple(
-    float(v) for v in os.getenv("RADAR_SENSOR_OFFSET", "2.0,0.0,1.2").split(",")
-)
-
-CAMERA_INTRINSICS = make_default_camera_intrinsics(
-    image_width=int(os.getenv("CAMERA_IMAGE_WIDTH", "1280")),
-    image_height=int(os.getenv("CAMERA_IMAGE_HEIGHT", "720")),
-    fov_deg=float(os.getenv("CAMERA_FOV_DEG", "90")),
-)
-CAMERA_EXTRINSICS = {
-    "offset": tuple(
-        float(v) for v in os.getenv("CAMERA_SENSOR_OFFSET", "1.5,0.0,2.2").split(",")
-    )
-}
-
-DT_FALLBACK = float(os.getenv("M3_DT_FALLBACK", "0.2"))  # used only if two frames share a timestamp
-MIN_HISTORY_TO_PREDICT = int(os.getenv("MIN_HISTORY_TO_PREDICT", "2"))
-HISTORY_MAX_LEN = int(os.getenv("HISTORY_MAX_LEN", "15"))
+LOG_DIR = Path(config.LOG_DIR)
+LOG_DIR.mkdir(exist_ok=True)
+TRACKS_LOG_PATH = LOG_DIR / config.TRACKS_LOG_FILE
 
 
-# ============================================================
-# 3. Byte -> numpy decoding
-# ============================================================
-
-def decode_lidar_bytes(lidar_bytes: bytes) -> np.ndarray:
-    """
-    Raw LiDAR bytes -> (N, 3) numpy array of (x, y, z) in the EGO frame.
-
-    Empty/undersized input returns an empty (0, 3) array rather than
-    raising, so a frame with a temporarily-empty LiDAR buffer doesn't
-    crash the whole pipeline -- lidar_processing.py's functions already
-    handle empty arrays gracefully.
-    """
-    if not lidar_bytes:
-        return np.empty((0, 3), dtype=np.float32)
-
-    flat = np.frombuffer(lidar_bytes, dtype=np.float32)
-    if flat.size % LIDAR_POINT_STRIDE != 0:
-        LOGGER.warning(
-            "LiDAR byte buffer size (%d floats) isn't divisible by "
-            "LIDAR_POINT_STRIDE=%d -- check LIDAR_POINT_STRIDE against "
-            "your actual M1 sensor format.",
-            flat.size, LIDAR_POINT_STRIDE,
-        )
-        return np.empty((0, 3), dtype=np.float32)
-
-    points = flat.reshape(-1, LIDAR_POINT_STRIDE)
-    xyz_sensor_frame = points[:, :3]  # drop intensity (4th column)
-
-    return sensor_to_ego(xyz_sensor_frame, LIDAR_SENSOR_OFFSET)
+def _json_default(obj: Any):
+    """Defensive safety net for json.dumps(...) below and for the M4 forward
+    payload. Live testing found a raw numpy.bool_ (from
+    `python_bool and numpy_bool` short-circuiting) leak through
+    Track.is_static into this exact path -- json.dumps has no idea how to
+    serialize it, which silently 500'd the tracks-log write for ~150
+    consecutive frames and, since M4 forwarding is fire-and-forget, silently
+    broke 100% of M3->M4 delivery with no visible error. The root cause is
+    fixed at the source (track_types.Track.refresh_static_flag now wraps in
+    bool(...)), but this stays as a second line of defense against the same
+    class of bug from any future numpy leak."""
+    if isinstance(obj, np.bool_):
+        return bool(obj)
+    if isinstance(obj, np.integer):
+        return int(obj)
+    if isinstance(obj, np.floating):
+        return float(obj)
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
 
 
-def decode_radar_bytes(radar_bytes: bytes) -> list[dict[str, Any]]:
-    """
-    Raw radar bytes -> M3's expected radar_dets format:
-        [{"position": [x, y], "relative_velocity": [vx, vy]}, ...]
+class CameraDetection(BaseModel):
+    class_id: int
+    class_name: str
+    confidence: float
+    box: list[float]
 
-    Converts each raw (velocity, azimuth, altitude, depth) detection
-    via radar_processing.from_carla_format(), which already handles
-    the range/azimuth -> (x,y) trigonometry and applies the sensor
-    mounting offset.
-    """
-    if not radar_bytes:
-        return []
-
-    flat = np.frombuffer(radar_bytes, dtype=np.float32)
-    if flat.size % 4 != 0:
-        LOGGER.warning(
-            "Radar byte buffer size (%d floats) isn't divisible by 4 -- "
-            "check the raw radar format against your M1 setup.",
-            flat.size,
-        )
-        return []
-
-    detections = flat.reshape(-1, 4)
-    col = {name: idx for idx, name in enumerate(RADAR_COLUMN_ORDER)}
-
-    radar_dets = []
-    for row in detections:
-        converted = from_carla_format(
-            range_m=float(row[col["depth"]]),
-            azimuth_rad=float(row[col["azimuth"]]),
-            altitude_rad=float(row[col["altitude"]]),
-            radial_velocity=float(row[col["velocity"]]),
-            sensor_offset_xyz=RADAR_SENSOR_OFFSET,
-        )
-        radar_dets.append(converted)
-    return radar_dets
-
-
-def convert_camera_detections(m2_detections: list[dict[str, Any]],
-                                timestamp: float, frame_id: int) -> list[dict[str, Any]]:
-    """
-    Converts M2's detection format:
-        {"class_id": int, "class_name": str, "confidence": float, "box": [x1,y1,x2,y2]}
-    into M3's fusion.py expected format:
-        {"class": str, "confidence": float, "bbox": [x1,y1,x2,y2], "timestamp": float, "frame_id": int}
-    """
-    converted = []
-    for det in m2_detections:
-        converted.append({
-            "class": det["class_name"],
-            "confidence": det["confidence"],
-            "bbox": det["box"],
-            "timestamp": timestamp,
-            "frame_id": frame_id,
-        })
-    return converted
-
-
-# ============================================================
-# 4. Persistent M3 + M4 runtime state
-#    (tracking and history MUST persist across HTTP requests --
-#    each POST is one frame, not a full run)
-# ============================================================
-
-class M3Runtime:
-    """Owns the tracker, history buffer, and per-run state across frames."""
-
-    def __init__(self) -> None:
-        self.tracker = MultiObjectTracker(
-            max_match_distance_m=2.0,
-            min_hits_to_confirm=2,
-            max_age_without_update=5,
-        )
-        self.history = TrackHistoryBuffer(max_len=HISTORY_MAX_LEN)
-        self.last_timestamp: float | None = None
-        self.lock = threading.Lock()  # frames must be processed strictly in order
-        self.m5_broadcaster = M5UDPBroadcaster(
-            host=M5_UDP_HOST, port=M5_UDP_PORT, max_hz=M5_UDP_HZ
-        )
-
-    def process_frame(
-        self,
-        frame_id: int,
-        timestamp: float,
-        ego_speed_mps: float,
-        ego_position: list[float],
-        ego_velocity: list[float],
-        ego_yaw_deg: float,
-        camera_dets: list[dict],
-        lidar_points: np.ndarray,
-        radar_dets: list[dict],
-    ) -> dict[str, Any]:
-        with self.lock:
-            dt = DT_FALLBACK
-            if self.last_timestamp is not None:
-                dt = max(timestamp - self.last_timestamp, 1e-3)
-            self.last_timestamp = timestamp
-
-            # ---- M3: LiDAR processing ----
-            lidar_clusters = process_lidar_frame(lidar_points)
-            raw_roi_points = get_raw_roi_points(lidar_points)
-
-            # ---- M3: Radar processing ----
-            radar_clean = process_radar_frame(radar_dets)
-
-            # ---- M3: Fusion ----
-            fused = fuse_frame(
-                camera_dets, lidar_clusters, radar_clean,
-                CAMERA_INTRINSICS, CAMERA_EXTRINSICS, raw_roi_points,
-            )
-
-            # ---- M3: Tracking -> tracked_objects (UNCHANGED output format) ----
-            tracked_objects = self.tracker.step(fused, dt=dt, timestamp=timestamp)
-
-            LOGGER.info(
-                "[PIPELINE][frame %s] "
-                "camera=%d | lidar=%d | radar=%d | fused=%d | tracked=%d",
-                frame_id,
-                len(camera_dets),
-                len(lidar_clusters),
-                len(radar_clean),
-                len(fused),
-                len(tracked_objects),
-            )
-
-            # ---- M4: history + predictions (same logic as run_pipeline.py) ----
-            self.history.update(tracked_objects)
-            frame_predictions = []
-            for obj in tracked_objects:
-                track_id = obj["track_id"]
-                track_history = self.history.get(track_id)
-                if len(track_history) < MIN_HISTORY_TO_PREDICT:
-                    continue
-                prediction = predict(
-                    track_id=track_id,
-                    cls=obj["class"],
-                    track_history=track_history,
-                    confidence=obj["confidence"],
-                )
-                frame_predictions.append(prediction)
-                # LOGGER.info(
-                #     "[M4] frame %s | track=%s | class=%s | branches=%d",
-                #     frame_id,
-                #     prediction["track_id"],
-                #     prediction["class"],
-                #     len(prediction["trajectories"]),
-                # )
-
-                print(
-                    f"\n[M4] frame={frame_id} | "
-                    f"track={prediction['track_id']} | "
-                    f"class={prediction['class']} | "
-                    f"confidence={prediction['confidence']:.2f}"
-                )
-
-                print(
-                    f"     position=({prediction['position'][0]:.2f}, "
-                    f"{prediction['position'][1]:.2f}) | "
-                    f"velocity=({prediction['velocity'][0]:.2f}, "
-                    f"{prediction['velocity'][1]:.2f})"
-                )
-
-                for branch in prediction["trajectories"]:
-                    print(
-                        f"     {branch['mode']}: "
-                        f"probability={branch['probability']:.2f} | "
-                        f"points={len(branch['points'])} | "
-                        f"end=({branch['points'][-1]['x']:.2f}, "
-                        f"{branch['points'][-1]['y']:.2f})"
-                    )
-
-            # M4 -> M5: publish exactly the agreed prediction contract.
-            self.m5_broadcaster.send(
-                timestamp=timestamp,
-                predictions=frame_predictions,
-                ego_speed_mps=ego_speed_mps,
-                ego_position=ego_position,
-                ego_velocity=ego_velocity,
-                ego_yaw_deg=ego_yaw_deg,
-            )
-
-            return {
-                "tracked_objects": tracked_objects,
-                "predictions": frame_predictions,
-            }
-
-
-runtime = M3Runtime()
-
-
-# ============================================================
-# 5. FastAPI app -- same FramePacket contract as M3_dummy_server.py,
-#    so M2's forward_to_m3() needs ZERO changes.
-# ============================================================
 
 class FramePacket(BaseModel):
     frame_id: int
     timestamp: float
-
-    ego_speed_mps: float
+    ego_speed_mps: float = 0.0
     ego_position: list[float]
-    ego_velocity: list[float]
-    ego_yaw_deg: float
-
-    camera_detections: list[dict[str, Any]]
+    ego_velocity: list[float] = [0.0, 0.0, 0.0]
+    ego_yaw_deg: float = 0.0
+    camera_detections: list[CameraDetection] = []
     lidar_bytes_b64: str
     radar_bytes_b64: str
-    lidar_size_bytes: int
-    radar_size_bytes: int
-    lidar_encoding: str
-    radar_encoding: str
+    lidar_size_bytes: int = 0
+    radar_size_bytes: int = 0
+    lidar_encoding: str = "base64"
+    radar_encoding: str = "base64"
+
+
+class M3Runtime:
+    def __init__(self) -> None:
+        self.tracker = Tracker()
+        self.last_timestamp: float | None = None
+        self.lock = asyncio.Lock()
+        self.frames_processed = 0
+        self.log_file = TRACKS_LOG_PATH.open("a", encoding="utf-8")
+        # asyncio.create_task() doesn't hold a strong reference to the task
+        # it returns -- without keeping one ourselves, a fire-and-forget M4
+        # forward can be garbage-collected mid-flight. Tasks remove
+        # themselves from this set via add_done_callback once complete.
+        self.background_tasks: set[asyncio.Task] = set()
+
+    def close(self) -> None:
+        self.log_file.close()
+
+
+runtime = M3Runtime()
+http_client: httpx.AsyncClient | None = None
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    LOGGER.info(
-        "M3 server ready. LIDAR_SENSOR_OFFSET=%s RADAR_SENSOR_OFFSET=%s",
-        LIDAR_SENSOR_OFFSET, RADAR_SENSOR_OFFSET
-    )
-    LOGGER.info(
-        "M4 -> M5 UDP broadcaster ready at %s:%d (max %.1f Hz)",
-        M5_UDP_HOST, M5_UDP_PORT, M5_UDP_HZ
-    )
+    global http_client
+    http_client = httpx.AsyncClient(timeout=httpx.Timeout(M4_TIMEOUT_SECONDS))
     yield
-    runtime.m5_broadcaster.close()
+    if runtime.background_tasks:
+        await asyncio.gather(*runtime.background_tasks, return_exceptions=True)
+    await http_client.aclose()
+    runtime.close()
 
 
-app = FastAPI(title="M3 Fusion + Tracking Server", version="1.0.0", lifespan=lifespan)
+app = FastAPI(title="M3 Sensor Fusion + Tracking Server", lifespan=lifespan)
+
+
+@app.middleware("http")
+async def log_request_time(request: Request, call_next):
+    start_time = time.perf_counter()
+    response = await call_next(request)
+    process_time = time.perf_counter() - start_time
+    response.headers["X-Process-Time"] = str(process_time)
+    return response
+
+
+def _to_track_dict(track, timestamp: float, ego_position: np.ndarray, ego_yaw_deg: float) -> dict[str, Any]:
+    position_world = track.kf.position
+    velocity_world = track.kf.velocity
+    position_ego = world_to_ego(position_world.reshape(1, 3), ego_position, ego_yaw_deg)[0]
+    return {
+        "track_id": track.track_id,
+        "class": track.class_name,
+        "position": [float(v) for v in position_world],
+        "position_ego_relative": [float(v) for v in position_ego],
+        "velocity": [float(v) for v in velocity_world],
+        "speed_mps": float(np.linalg.norm(velocity_world[:2])),
+        "heading_deg": track.heading_deg,
+        "size": [float(v) for v in track.size],
+        "confidence": float(track.class_confidence),
+        "age": track.age_frames,
+        "hits": track.hits,
+        "time_since_update": float(timestamp - track.last_update_time),
+        "last_seen": track.last_update_time,
+        "sensor_sources": sorted(track.sensor_sources),
+        "timestamp": timestamp,
+        "track_status": track.status,
+        "is_static": track.is_static,
+        # Diagnostic only -- not part of the frozen M3->M4 contract (see
+        # README's "Run #4 (planned diagnostic)" note). Which association
+        # pass last updated this track ("primary" | "cascade" | "spawn") and
+        # that match's raw cost (squared Mahalanobis distance for "primary",
+        # meters for "cascade"), so a residual rare velocity-jump case can be
+        # attributed to a specific pass from the logged data alone.
+        "last_match_pass": track.last_match_pass,
+        "last_match_cost": track.last_match_cost,
+    }
+
+
+async def _forward_to_m4(payload: dict) -> None:
+    """Fire-and-forget: awaited from a background task, never from the
+    request handler. An earlier version awaited this inline before replying
+    to M2, which chained an extra network round-trip onto the already
+    latency-sensitive M1->M2->M3 critical path -- live testing flagged this
+    as a contributor to the pipeline's effective throughput dropping well
+    below CARLA's 20Hz tick rate. M4's outcome is logged here instead of
+    being reported back through the HTTP response."""
+    if http_client is None:
+        return
+    try:
+        body = json.dumps(payload, default=_json_default).encode("utf-8")
+        response = await http_client.post(
+            M4_DOWNSTREAM_URL, content=body, headers={"Content-Type": "application/json"}
+        )
+        if response.status_code != 200:
+            LOGGER.warning("M4 returned HTTP %s for frame %s", response.status_code, payload.get("frame_id"))
+    except (httpx.HTTPError, OSError, TypeError) as exc:
+        LOGGER.warning("Could not forward tracks to M4 (frame %s): %s", payload.get("frame_id"), exc)
 
 
 @app.post("/api/v1/downstream")
-async def receive_downstream_packet(packet: FramePacket) -> JSONResponse:
-    LOGGER.info("[frame %s] received: detections=%d lidar_bytes=%d radar_bytes=%d",
-                packet.frame_id, len(packet.camera_detections),
-                packet.lidar_size_bytes, packet.radar_size_bytes)
+async def downstream(packet: FramePacket) -> JSONResponse:
+    t0 = time.perf_counter()
+    async with runtime.lock:
+        ego_position = np.array(packet.ego_position, dtype=float)
+        ego_yaw_deg = packet.ego_yaw_deg
 
-    try:
-        lidar_bytes = base64.b64decode(packet.lidar_bytes_b64)
-        radar_bytes = base64.b64decode(packet.radar_bytes_b64)
-    except Exception as exc:  # noqa: BLE001
-        LOGGER.error("[frame %s] base64 decoding failed: %s", packet.frame_id, exc)
-        raise HTTPException(status_code=400, detail="Invalid Base64 payload encoding") from exc
+        try:
+            lidar_bytes = base64.b64decode(packet.lidar_bytes_b64)
+            radar_bytes = base64.b64decode(packet.radar_bytes_b64)
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(status_code=400, detail="Invalid base64 sensor payload") from exc
 
-    try:
-        lidar_points = decode_lidar_bytes(lidar_bytes)
-        radar_dets = decode_radar_bytes(radar_bytes)
-        camera_dets = convert_camera_detections(
-            packet.camera_detections, packet.timestamp, packet.frame_id
-        )
-        result = runtime.process_frame(
-            packet.frame_id,
-            packet.timestamp,
-            packet.ego_speed_mps,
-            packet.ego_position,
-            packet.ego_velocity,
-            packet.ego_yaw_deg,
-            camera_dets,
-            lidar_points,
-            radar_dets,
-        )
-    except Exception as exc:  # noqa: BLE001
-        LOGGER.exception("[frame %s] M3/M4 processing failed", packet.frame_id)
-        raise HTTPException(status_code=500, detail=f"M3 processing failed: {exc}") from exc
+        camera_detections = [d.model_dump() for d in packet.camera_detections]
 
+        fused_ego = sensor_fusion.fuse_frame(camera_detections, lidar_bytes, radar_bytes)
+
+        radar_mount = np.array([[config.RADAR_TRANSFORM.x, config.RADAR_TRANSFORM.y, config.RADAR_TRANSFORM.z]])
+        radar_sensor_world = ego_to_world(radar_mount, ego_position, ego_yaw_deg)[0]
+
+        detections_world = []
+        for obj in fused_ego:
+            position_world = ego_to_world(obj["position_ego"].reshape(1, 3), ego_position, ego_yaw_deg)[0]
+            det = {**obj, "position_world": position_world}
+            if "radar_target" in obj:
+                det["radar_sensor_position_world"] = radar_sensor_world
+            detections_world.append(det)
+
+        dt = config.DEFAULT_DT
+        if runtime.last_timestamp is not None:
+            dt = max(1e-3, packet.timestamp - runtime.last_timestamp)
+        runtime.last_timestamp = packet.timestamp
+
+        runtime.tracker.predict(dt)
+        runtime.tracker.update(detections_world, packet.timestamp, ego_position)
+        runtime.frames_processed += 1
+
+        tracked = [
+            _to_track_dict(t, packet.timestamp, ego_position, ego_yaw_deg)
+            for t in runtime.tracker.confirmed_tracks()
+        ]
+
+        log_record = {
+            "frame_id": packet.frame_id,
+            "timestamp": packet.timestamp,
+            "ego_position": packet.ego_position,
+            "ego_yaw_deg": ego_yaw_deg,
+            "num_camera_detections": len(camera_detections),
+            "num_fused_candidates": len(fused_ego),
+            "num_tracks_total": len(runtime.tracker.tracks),
+            "tracked_objects": tracked,
+        }
+        runtime.log_file.write(json.dumps(log_record, default=_json_default) + "\n")
+        runtime.log_file.flush()
+
+    m4_task = asyncio.create_task(_forward_to_m4({
+        "frame_id": packet.frame_id,
+        "timestamp": packet.timestamp,
+        "ego_position": packet.ego_position,
+        "ego_velocity": packet.ego_velocity,
+        "ego_yaw_deg": ego_yaw_deg,
+        "tracked_objects": tracked,
+    }))
+    runtime.background_tasks.add(m4_task)
+    m4_task.add_done_callback(runtime.background_tasks.discard)
+
+    elapsed_ms = (time.perf_counter() - t0) * 1000.0
     LOGGER.info(
-        "[frame %s] tracked_objects=%d predictions=%d",
-        packet.frame_id, len(result["tracked_objects"]), len(result["predictions"]),
+        "[M3] frame=%s fused=%d tracks_total=%d confirmed=%d latency=%.2fms",
+        packet.frame_id, len(fused_ego), len(runtime.tracker.tracks), len(tracked), elapsed_ms,
     )
 
-    # return JSONResponse(content={
-    #     "status": "received",
-    #     "frame_id": packet.frame_id,
-    #     "processed_detections": len(packet.camera_detections),
-    #     "tracked_objects_count": len(result["tracked_objects"]),
-    #     "predictions_count": len(result["predictions"]),
-    # })
-
     return JSONResponse(content={
-    "status": "received",
-    "frame_id": packet.frame_id,
-    "processed_detections": len(packet.camera_detections),
-    "tracked_objects_count": len(result["tracked_objects"]),
-    "predictions_count": len(result["predictions"]),
-    "tracked_objects": result["tracked_objects"],
-    "predictions": result["predictions"],
+        "status": "ok",
+        "frame_id": packet.frame_id,
+        "processed_detections": len(camera_detections),
+        "fused_candidates": len(fused_ego),
+        "tracked_objects_count": len(tracked),
+        "latency_ms": elapsed_ms,
     })
 
 
 @app.get("/health")
-async def health_check() -> JSONResponse:
+async def health() -> JSONResponse:
     return JSONResponse(content={
         "status": "ok",
-        "service": "m3-fusion-tracking",
+        "service": "m3-sensor-fusion-tracking",
+        "frames_processed": runtime.frames_processed,
         "active_tracks": len(runtime.tracker.tracks),
-        "lidar_point_stride": LIDAR_POINT_STRIDE,
-        "lidar_sensor_offset": LIDAR_SENSOR_OFFSET,
-        "radar_sensor_offset": RADAR_SENSOR_OFFSET,
+        "confirmed_tracks": len(runtime.tracker.confirmed_tracks()),
+        "m4_downstream_url": M4_DOWNSTREAM_URL,
     })
 
 
@@ -474,11 +290,8 @@ if __name__ == "__main__":
     import uvicorn
 
     uvicorn.run(
-        "M3_Pipeline.m3_server:app",
-        host=os.getenv("HOST", "0.0.0.0"),
-        port=int(os.getenv("PORT", "9000")),
+        "m3_server:app",
+        host=os.getenv("HOST", config.HOST),
+        port=int(os.getenv("PORT", str(config.PORT))),
         workers=1,
     )
-
-
-__all__ = ["app", "runtime", "decode_lidar_bytes", "decode_radar_bytes", "convert_camera_detections"]

@@ -1,119 +1,138 @@
-"""
-lidar_processing.py
-====================
-Turns a raw LiDAR point cloud (thousands of individual (x,y,z) dots --
-one dot per laser beam that hit something) into a short list of
-"clusters" -- one entry per real object nearby.
+"""LiDAR point-cloud processing.
 
-Pipeline:
-    raw points
-        -> remove ground points (the road surface)
-        -> keep only points within a region of interest (ROI)
-        -> group remaining points into clusters (DBSCAN)
-        -> summarize each cluster as one 3D box (center + size)
+CARLA's `sensor.lidar.ray_cast` raw_data is a flat float32 buffer, 4 values
+per point: (x, y, z, intensity), in the LiDAR sensor's own local frame
+(X-forward, Y-right, Z-up). See scenario3.py `_setup_sensors`, which listens
+with `self.lidar.listen(lambda x: self.lidar_buf.put(x.frame, bytes(x.raw_data)))`.
+
+Pipeline (Python, per M3 mentor notes section 9):
+    decode -> transform to ego frame -> ROI filter -> ground removal (RANSAC
+    plane) -> Euclidean clustering -> per-cluster 3D obstacle summary.
 """
+from __future__ import annotations
 
 import numpy as np
-from sklearn.cluster import DBSCAN
+from scipy.spatial import cKDTree
+
+import config
+from coordinate_transforms import local_to_parent
 
 
-def remove_ground(points: np.ndarray, ground_z_threshold: float = 0.15) -> np.ndarray:
-    """
-    Deletes points that are basically part of the flat road surface.
-
-    Simple approach (good enough for a student project): any point
-    whose height (z) is below `ground_z_threshold` meters is treated as
-    ground and removed. This works because our ego frame's z=0 is
-    roughly road height, and the road is close to flat locally.
-
-    (A more advanced approach -- fitting a plane with RANSAC -- handles
-    slightly sloped roads better, but constant-height filtering is a
-    reasonable, fast starting point.)
-    """
-    if len(points) == 0:
-        return points
-    mask = points[:, 2] > ground_z_threshold
-    return points[mask]
+def decode_lidar(raw_bytes: bytes) -> np.ndarray:
+    """Return an (N,4) array of [x,y,z,intensity] in LiDAR-local frame."""
+    if not raw_bytes:
+        return np.zeros((0, 4), dtype=np.float32)
+    points = np.frombuffer(raw_bytes, dtype=np.float32)
+    usable = (points.size // 4) * 4
+    return points[:usable].reshape(-1, 4)
 
 
-def filter_roi(points: np.ndarray, max_forward: float = 50.0,
-                max_sideways: float = 15.0, max_height: float = 3.0) -> np.ndarray:
-    """
-    Keeps only points inside a "region of interest" box around the car:
-    up to `max_forward` meters ahead, `max_sideways` meters to either
-    side, and below `max_height` meters tall. Anything outside this box
-    is too far away to matter for immediate driving decisions, so we
-    drop it to keep later steps fast and clean.
-    """
-    if len(points) == 0:
-        return points
-    x, y, z = points[:, 0], points[:, 1], points[:, 2]
+def to_ego_frame(points_lidar_xyz: np.ndarray) -> np.ndarray:
+    """Translate LiDAR-local points into the ego-vehicle frame."""
+    return local_to_parent(points_lidar_xyz, config.LIDAR_TRANSFORM)
+
+
+def apply_roi(points_ego: np.ndarray) -> np.ndarray:
+    if points_ego.shape[0] == 0:
+        return points_ego
+    x, y, z = points_ego[:, 0], points_ego[:, 1], points_ego[:, 2]
     mask = (
-        (x > 0) & (x < max_forward) &
-        (np.abs(y) < max_sideways) &
-        (z < max_height)
+        (x >= config.LIDAR_ROI_X_MIN) & (x <= config.LIDAR_ROI_X_MAX)
+        & (y >= config.LIDAR_ROI_Y_MIN) & (y <= config.LIDAR_ROI_Y_MAX)
+        & (z >= config.LIDAR_ROI_Z_MIN) & (z <= config.LIDAR_ROI_Z_MAX)
     )
-    return points[mask]
+    return points_ego[mask]
 
 
-def cluster_points(points: np.ndarray, eps: float = 0.5, min_samples: int = 5):
-    """
-    Groups nearby points into clusters using DBSCAN: any points within
-    `eps` meters of each other are considered part of the same object,
-    as long as a cluster has at least `min_samples` points (this
-    filters out lone noisy points that aren't a real object).
+def remove_ground(points_ego: np.ndarray, rng: np.random.Generator | None = None) -> tuple[np.ndarray, np.ndarray]:
+    """RANSAC-fit a (roughly horizontal) ground plane and split points into
+    (non_ground, ground). Falls back to a flat height threshold around the
+    assumed ground plane if too few points remain to fit reliably (e.g. a
+    near-empty scan)."""
+    n = points_ego.shape[0]
+    if n < 50:
+        return points_ego, np.zeros((0, 3))
 
-    Returns: list of clusters, each cluster is a dict:
-        {
-            "center": [x, y, z],       # centroid of the cluster
-            "size": [length, width, height],
-            "num_points": int,
-            "points": (M, 3) array     # kept for debugging/visualization
-        }
-    """
-    if len(points) < min_samples:
+    rng = rng or np.random.default_rng(0)
+    best_inliers = None
+    best_count = -1
+    xyz = points_ego[:, :3]
+    for _ in range(config.LIDAR_GROUND_RANSAC_ITERATIONS):
+        sample_idx = rng.choice(n, size=3, replace=False)
+        p1, p2, p3 = xyz[sample_idx]
+        normal = np.cross(p2 - p1, p3 - p1)
+        norm = np.linalg.norm(normal)
+        if norm < 1e-6:
+            continue
+        normal = normal / norm
+        if abs(normal[2]) < 0.85:  # reject near-vertical planes (walls, vehicle sides)
+            continue
+        d = -normal.dot(p1)
+        dist = np.abs(xyz.dot(normal) + d)
+        inliers = dist < config.LIDAR_GROUND_DIST_THRESHOLD_M
+        count = int(inliers.sum())
+        if count > best_count:
+            best_count, best_inliers = count, inliers
+
+    if best_inliers is None or best_count < config.LIDAR_GROUND_MIN_INLIER_RATIO * n:
+        ground_z = config.GROUND_PLANE_EGO_Z
+        mask = xyz[:, 2] < ground_z + config.LIDAR_GROUND_DIST_THRESHOLD_M
+        return points_ego[~mask], points_ego[mask]
+
+    return points_ego[~best_inliers], points_ego[best_inliers]
+
+
+def cluster_points(points_ego: np.ndarray) -> list[dict]:
+    """Radius-connectivity clustering (a dependency-light stand-in for
+    DBSCAN, using the same core idea: connect points within
+    `LIDAR_CLUSTER_EPS_M`, then drop components smaller than
+    `LIDAR_CLUSTER_MIN_POINTS` as noise)."""
+    n = points_ego.shape[0]
+    if n == 0:
         return []
+    xyz = points_ego[:, :3]
+    tree = cKDTree(xyz)
+    pairs = tree.query_pairs(r=config.LIDAR_CLUSTER_EPS_M, output_type="ndarray")
 
-    labels = DBSCAN(eps=eps, min_samples=min_samples).fit_predict(points)
+    parent = np.arange(n)
 
+    def find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    def union(i, j):
+        ri, rj = find(i), find(j)
+        if ri != rj:
+            parent[ri] = rj
+
+    for i, j in pairs:
+        union(int(i), int(j))
+
+    roots = np.array([find(i) for i in range(n)])
     clusters = []
-    for label in set(labels):
-        if label == -1:
-            continue  # -1 = noise points DBSCAN couldn't group; discard
-        cluster_pts = points[labels == label]
-        center = cluster_pts.mean(axis=0)
-        size = cluster_pts.max(axis=0) - cluster_pts.min(axis=0)
+    for root in np.unique(roots):
+        idx = np.where(roots == root)[0]
+        if idx.size < config.LIDAR_CLUSTER_MIN_POINTS:
+            continue
+        pts = xyz[idx]
+        centroid = pts.mean(axis=0)
+        mins, maxs = pts.min(axis=0), pts.max(axis=0)
+        size = np.maximum(maxs - mins, 0.15)  # floor so degenerate clusters still have volume
         clusters.append({
-            "center": center.tolist(),
-            "size": size.tolist(),
-            "num_points": len(cluster_pts),
-            "points": cluster_pts,
+            "centroid_ego": centroid,
+            "size": size,  # [length(x), width(y), height(z)]
+            "num_points": int(idx.size),
+            "points_ego": pts,
         })
     return clusters
 
 
-def get_raw_roi_points(raw_points: np.ndarray, max_forward: float = 50.0,
-                        max_sideways: float = 15.0, max_height: float = 3.0) -> np.ndarray:
-    """
-    Like process_lidar_frame(), but WITHOUT ground removal -- keeps
-    points near road height. Needed for matching road-surface classes
-    (pothole, speed_bump) in fusion.py, since remove_ground() would
-    otherwise delete exactly the points that describe them.
-    """
-    return filter_roi(raw_points, max_forward, max_sideways, max_height)
-
-
-def process_lidar_frame(raw_points: np.ndarray,
-                         ground_z_threshold: float = 0.15,
-                         max_forward: float = 50.0,
-                         max_sideways: float = 15.0,
-                         cluster_eps: float = 0.5,
-                         cluster_min_samples: int = 5):
-    """
-    Convenience wrapper: runs the full LiDAR pipeline in one call.
-    This is the function main.py actually calls each frame.
-    """
-    pts = remove_ground(raw_points, ground_z_threshold)
-    pts = filter_roi(pts, max_forward, max_sideways)
-    clusters = cluster_points(pts, cluster_eps, cluster_min_samples)
-    return clusters
+def process(raw_bytes: bytes) -> list[dict]:
+    """Full LiDAR pipeline: raw bytes -> obstacle clusters in ego frame."""
+    raw = decode_lidar(raw_bytes)
+    ego_pts = to_ego_frame(raw[:, :3])
+    roi_pts = apply_roi(ego_pts)
+    non_ground, _ground = remove_ground(roi_pts)
+    return cluster_points(non_ground)

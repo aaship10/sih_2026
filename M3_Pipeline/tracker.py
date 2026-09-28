@@ -1,204 +1,226 @@
-"""
-tracker.py
-==========
-Turns single-frame fused detections into persistent objects with IDs
-that stay the same across frames ("Object #17" stays "#17" as it
-moves), instead of treating every frame as brand-new strangers.
+"""Multi-object tracking: turns per-frame fused detections into persistent
+tracks with stable IDs, via a constant-velocity Kalman filter per track and
+Hungarian-algorithm nearest-neighbor data association (M3 mentor notes,
+section 15 -- deliberately the simplest reliable design: no learned
+association, no appearance embeddings).
 
-Two jobs happen here:
-  1. DATA ASSOCIATION: which existing track does each new detection
-     belong to? (simple nearest-position matching)
-  2. KALMAN FILTER: smooths noisy position readings and estimates
-     velocity, by blending "what we predicted" with "what we measured".
+Tracking is done in the CARLA *world* frame, not the ego frame: the ego
+vehicle accelerates and turns, which would inject fictitious forces into a
+constant-velocity model if tracking were done in a frame attached to it.
+Fused detections are converted ego -> world (using the ego pose carried on
+each FramePacket) before being handed to `update`.
 
-State per track: [x, y, vx, vy]  (position + velocity, 2D is enough
-for ground-vehicle path planning; z/height is carried along separately
-for reference but not filtered).
+Association runs in two passes (added, then revised, after two rounds of
+live CARLA testing surfaced concrete failure modes -- see README "Live CARLA
+test findings & fixes"):
+
+  Pass 1 -- Mahalanobis-gated Hungarian assignment across ALL tracks and
+  detections, using each track's own Kalman covariance instead of a flat
+  Euclidean radius. A fixed-radius gate let a faster, unrelated cluster
+  hijack a well-established track on live data; weighting by the track's
+  actual uncertainty (plus a hard absolute-distance safety cap) fixes that.
+
+  Pass 2 -- a more permissive cascade for still-unmatched "unknown"-class
+  tracks against still-unmatched "unknown"-class detections (see
+  config.py's "Unknown-class cascade" notes for why this is gated on class,
+  not on `Track.is_static` as it originally was -- that had a
+  chicken-and-egg problem where a track needed to survive Pass 1 long enough
+  to prove itself static before it could get help surviving Pass 1). LiDAR
+  clustering jitter on clutter (curbs, potholes, building edges, parked
+  vehicles) produces cluster shapes that shift frame to frame even when the
+  object hasn't moved; without this pass, every jitter that fell outside the
+  tight Pass-1 gate spawned a brand-new track_id for the same physical
+  object. Pass 2's match itself is Euclidean-only (no Mahalanobis check --
+  see config.py's "Run #3 finding" for why a hard distance/dt cutoff doesn't
+  work here either), so `_apply_measurement` feeds it into the Kalman filter
+  with a deliberately loose position measurement noise
+  (config.CASCADE_POSITION_MEASUREMENT_STD) instead of the normal one: a
+  wrong one-off cascade match then only nudges the state gently instead of
+  forcing a full-trust jump, which is what let a fast unrelated cluster drag
+  a slow/static track's velocity up to 29.8 m/s on live data before this fix.
+
+Radar association gets its own gate inside `_apply_measurement`
+(`KalmanFilter6D.radar_los_innovation`): sensor_fusion.py proposes a radar
+candidate by proximity alone (nearest within RADAR_ASSOC_MAX_DIST_M), with
+no idea which track it's near, so a fast unrelated target can be the
+"nearest" radar return to an unrelated, slow/static track. Before a radar
+reading counts toward RADAR_MIN_STREAK at all, it must be statistically
+consistent with the track's OWN current velocity estimate and uncertainty --
+a reading that's wildly inconsistent with a converged, tight-covariance
+track is rejected outright (and doesn't reset progress towards nothing, it
+just doesn't start a streak), while a track that's still uncertain (young,
+or genuinely accelerating) naturally has a wider gate and isn't blocked.
 """
+from __future__ import annotations
+
+import itertools
 
 import numpy as np
+from scipy.optimize import linear_sum_assignment
+
+import config
+from kalman_filter import KalmanFilter6D
+from track_types import Track
+
+# scipy's linear_sum_assignment raises ValueError("cost matrix is infeasible")
+# when a row/column is entirely np.inf (e.g. a single track vs. a single
+# detection with no valid match) -- a large finite sentinel avoids that while
+# still being trivially distinguishable from any real gated cost.
+_NO_MATCH_COST = 1e6
 
 
-class Track:
-    """One tracked object with a persistent ID."""
+class Tracker:
+    def __init__(self) -> None:
+        self._next_id = itertools.count(1)
+        self.tracks: list[Track] = []
 
-    _next_id = 1  # class-level counter so every new Track gets a unique ID
-
-    def __init__(self, position_xy, velocity_xy, cls, confidence, size, timestamp):
-        self.track_id = Track._next_id
-        Track._next_id += 1
-
-        # Kalman filter state: [x, y, vx, vy]
-        self.state = np.array([position_xy[0], position_xy[1], velocity_xy[0], velocity_xy[1]], dtype=float)
-
-        # uncertainty (covariance) -- starts fairly uncertain, shrinks as
-        # we get more confirming measurements
-        self.P = np.eye(4) * 5.0
-
-        self.cls = cls
-        self.confidence = confidence
-        self.size = size
-        self.z = position_xy[2] if len(position_xy) > 2 else 0.0
-
-        self.age = 1                 # how many frames this track has existed
-        self.hits = 1                # how many frames it was actually matched to a detection
-        self.time_since_update = 0   # frames since last matched detection (for deletion)
-        self.last_seen = timestamp
-
-    # ---- Kalman filter math ----
-
-    def predict(self, dt):
-        """
-        Predict step: "based on last known velocity, where should this
-        object be NOW?" Simple constant-velocity motion model:
-            x_new = x + vx * dt
-            y_new = y + vy * dt
-            vx, vy stay the same (we assume no sudden acceleration
-            between frames, which is a fine approximation at 5-10 Hz)
-        """
-        F = np.array([
-            [1, 0, dt, 0],
-            [0, 1, 0, dt],
-            [0, 0, 1, 0],
-            [0, 0, 0, 1],
-        ])
-        # process noise: how much we trust the constant-velocity
-        # assumption -- small values, since real objects can accelerate
-        Q = np.eye(4) * 0.05
-
-        self.state = F @ self.state
-        self.P = F @ self.P @ F.T + Q
-        self.time_since_update += 1
-        self.age += 1
-
-    def update(self, position_xy, velocity_xy, confidence, size, timestamp):
-        """
-        Update step: blend the prediction with the new real measurement
-        (weighted by how much we trust each -- this weighting is what
-        the Kalman "gain" computes automatically).
-        """
-        # measurement = [x, y, vx, vy] (we treat radar's velocity as a
-        # direct measurement too, when available)
-        z_meas = np.array([position_xy[0], position_xy[1], velocity_xy[0], velocity_xy[1]])
-
-        H = np.eye(4)              # we measure the full state directly
-        R = np.eye(4) * 0.5        # measurement noise: how noisy we think detections are
-
-        y_residual = z_meas - H @ self.state
-        S = H @ self.P @ H.T + R
-        K = self.P @ H.T @ np.linalg.inv(S)   # Kalman gain
-
-        self.state = self.state + K @ y_residual
-        self.P = (np.eye(4) - K @ H) @ self.P
-
-        if len(position_xy) > 2:
-            self.z = position_xy[2]
-        self.cls = self.cls if confidence < self.confidence else self.cls
-        self.confidence = max(self.confidence, confidence) * 0.9 + confidence * 0.1
-        self.size = size if size is not None else self.size
-        self.hits += 1
-        self.time_since_update = 0
-        self.last_seen = timestamp
-
-    def to_output_dict(self):
-        """Formats this track exactly in the structure M4 expects."""
-        x, y, vx, vy = self.state
-        return {
-            "track_id": self.track_id,
-            "class": self.cls,
-            "position": [round(float(x), 2), round(float(y), 2), round(float(self.z), 2)],
-            "velocity": [round(float(vx), 2), round(float(vy), 2), 0.0],
-            "size": self.size,
-            "confidence": round(float(self.confidence), 2),
-            "age": self.age,
-            "last_seen": round(self.last_seen, 2),
-            "sensor_sources": ["camera", "lidar", "radar"],
-            "timestamp": round(self.last_seen, 2),
-        }
-
-
-class MultiObjectTracker:
-    """
-    Manages the full set of currently-tracked objects: matches new
-    detections to existing tracks, creates new tracks, deletes stale
-    ones, and predicts forward every frame.
-    """
-
-    def __init__(self, max_match_distance_m=2.0, min_hits_to_confirm=2,
-                 max_age_without_update=5):
-        self.tracks = []
-        self.max_match_distance_m = max_match_distance_m
-        self.min_hits_to_confirm = min_hits_to_confirm
-        self.max_age_without_update = max_age_without_update
-
-    def step(self, fused_detections, dt, timestamp):
-        """
-        Runs one full tracking cycle for the current frame:
-            1. Predict all existing tracks forward by dt.
-            2. Match detections to tracks (nearest position, within a
-               distance threshold).
-            3. Update matched tracks with their new measurement.
-            4. Create new tracks for detections that matched nothing.
-            5. Delete tracks that haven't been seen for too long
-               (handles temporary occlusion gracefully -- we don't
-               delete instantly, but we do eventually if it's really gone).
-
-        Returns: list of confirmed tracks in M4's expected output format.
-        """
-        # 1) predict
+    def predict(self, dt: float) -> None:
         for track in self.tracks:
-            track.predict(dt)
+            track.kf.predict(dt)
 
-        # only detections with a known 3D position (i.e. LiDAR-confirmed)
-        # can be matched/tracked with real position+velocity
-        usable_detections = [d for d in fused_detections if d["position"] is not None]
+    def update(self, detections: list[dict], timestamp: float, ego_position_world: np.ndarray) -> None:
+        """`detections` are fused objects with a `position_world` key (see
+        m3_server.py, where ego-frame fused objects are converted to world
+        frame before this call)."""
+        matched_tracks: set[int] = set()
+        matched_dets: set[int] = set()
 
-        # 2) match detections to existing tracks (greedy nearest-neighbor)
-        unmatched_detections = list(range(len(usable_detections)))
-        unmatched_tracks = list(range(len(self.tracks)))
-        matches = []  # (track_index, detection_index)
+        if self.tracks and detections:
+            cost = np.full((len(self.tracks), len(detections)), _NO_MATCH_COST)
+            for i, track in enumerate(self.tracks):
+                H, P, R = track.kf.H, track.kf.P, track.kf.R
+                S_inv = np.linalg.inv(H @ P @ H.T + R)
+                for j, det in enumerate(detections):
+                    y = det["position_world"] - track.kf.position
+                    if np.linalg.norm(y) > config.TRACK_GATING_MAX_DIST_M:
+                        continue
+                    mahalanobis_sq = float(y.T @ S_inv @ y)
+                    if mahalanobis_sq <= config.TRACK_GATING_CHI2:
+                        cost[i, j] = mahalanobis_sq
+            row_idx, col_idx = linear_sum_assignment(cost)
+            for r, c in zip(row_idx, col_idx):
+                if cost[r, c] < _NO_MATCH_COST:
+                    self._apply_measurement(
+                        self.tracks[r], detections[c], timestamp, ego_position_world, cost=float(cost[r, c])
+                    )
+                    matched_tracks.add(r)
+                    matched_dets.add(c)
 
-        for t_idx in list(unmatched_tracks):
-            track = self.tracks[t_idx]
-            best_d_idx = None
-            best_dist = self.max_match_distance_m
-            for d_idx in unmatched_detections:
-                det = usable_detections[d_idx]
-                dx = track.state[0] - det["position"][0]
-                dy = track.state[1] - det["position"][1]
-                dist = np.hypot(dx, dy)
-                if dist < best_dist:
-                    best_dist = dist
-                    best_d_idx = d_idx
-            if best_d_idx is not None:
-                matches.append((t_idx, best_d_idx))
-                unmatched_tracks.remove(t_idx)
-                unmatched_detections.remove(best_d_idx)
+        unmatched_track_idx = [i for i in range(len(self.tracks)) if i not in matched_tracks]
+        unmatched_det_idx = [j for j in range(len(detections)) if j not in matched_dets]
 
-        # 3) update matched tracks
-        for t_idx, d_idx in matches:
-            det = usable_detections[d_idx]
-            self.tracks[t_idx].update(
-                det["position"], det["velocity"], det["confidence"], det["size"], timestamp
-            )
+        # Gated on class, not `is_static` -- see this module's and config.py's
+        # docstrings for why (chicken-and-egg: `is_static` needs hits this
+        # cascade exists to help a track accumulate in the first place).
+        unknown_track_idx = [i for i in unmatched_track_idx if self.tracks[i].class_name == "unknown"]
+        unknown_det_idx = [j for j in unmatched_det_idx if detections[j]["class_name"] == "unknown"]
+        if unknown_track_idx and unknown_det_idx:
+            cascade_radius = config.STATIC_CASCADE_DIST_FACTOR * config.TRACK_GATING_MAX_DIST_M
+            cost2 = np.full((len(unknown_track_idx), len(unknown_det_idx)), _NO_MATCH_COST)
+            for a, i in enumerate(unknown_track_idx):
+                for b, j in enumerate(unknown_det_idx):
+                    d = np.linalg.norm(self.tracks[i].kf.position - detections[j]["position_world"])
+                    if d <= cascade_radius:
+                        cost2[a, b] = d
+            row2, col2 = linear_sum_assignment(cost2)
+            cascade_matched_tracks: set[int] = set()
+            cascade_matched_dets: set[int] = set()
+            for a, b in zip(row2, col2):
+                if cost2[a, b] < _NO_MATCH_COST:
+                    i, j = unknown_track_idx[a], unknown_det_idx[b]
+                    self._apply_measurement(
+                        self.tracks[i], detections[j], timestamp, ego_position_world,
+                        cascade=True, cost=float(cost2[a, b]),
+                    )
+                    cascade_matched_tracks.add(i)
+                    cascade_matched_dets.add(j)
+            unmatched_track_idx = [i for i in unmatched_track_idx if i not in cascade_matched_tracks]
+            unmatched_det_idx = [j for j in unmatched_det_idx if j not in cascade_matched_dets]
 
-        # 4) create new tracks for leftover detections
-        for d_idx in unmatched_detections:
-            det = usable_detections[d_idx]
-            new_track = Track(
-                det["position"], det["velocity"], det["class"],
-                det["confidence"], det["size"], timestamp
-            )
-            self.tracks.append(new_track)
+        for i in unmatched_track_idx:
+            track = self.tracks[i]
+            track.misses += 1
+            track.radar_streak = 0
+            track.radar_miss_streak += 1
 
-        # 5) delete stale tracks (not seen for too many frames in a row --
-        # gives temporarily-occluded objects a grace period instead of
-        # deleting them the instant one frame is missed)
+        for j in unmatched_det_idx:
+            self._spawn_track(detections[j], timestamp)
+
+        for track in self.tracks:
+            track.age_frames += 1
+            if track.status == "tentative" and track.hits >= config.TRACK_CONFIRM_HITS:
+                track.status = "confirmed"
+
         self.tracks = [
-            t for t in self.tracks if t.time_since_update <= self.max_age_without_update
+            t for t in self.tracks
+            if t.misses <= config.TRACK_MAX_MISSES and (timestamp - t.last_update_time) <= config.TRACK_MAX_AGE_S
         ]
 
-        # only report tracks that have been confirmed by enough hits
-        # (avoids reporting a "track" from a single noisy detection)
-        confirmed = [t for t in self.tracks if t.hits >= self.min_hits_to_confirm]
-        return [t.to_output_dict() for t in confirmed]
+    def _apply_measurement(
+        self, track: Track, det: dict, timestamp: float, ego_position_world: np.ndarray,
+        cascade: bool = False, cost: float | None = None,
+    ) -> None:
+        track.last_match_pass = "cascade" if cascade else "primary"
+        track.last_match_cost = cost
+
+        if cascade:
+            cascade_R = np.eye(3) * (config.CASCADE_POSITION_MEASUREMENT_STD ** 2)
+            track.kf.update(det["position_world"], R=cascade_R)
+        else:
+            track.kf.update(det["position_world"])
+
+        if "radar_target" in det:
+            radar_sensor_world = det.get("radar_sensor_position_world", ego_position_world)
+            range_rate = det["radar_range_rate_mps"]
+            innovation = track.kf.radar_los_innovation(radar_sensor_world, range_rate)
+            consistent = innovation is not None and (innovation[0] ** 2 / innovation[1]) <= config.RADAR_LOS_GATE_CHI2
+            if consistent:
+                track.radar_streak += 1
+                track.radar_miss_streak = 0
+                track.last_radar_range_rate = range_rate
+                if track.radar_streak >= config.RADAR_MIN_STREAK:
+                    track.kf.update_radar_los(radar_sensor_world, range_rate)
+            else:
+                # Statistically inconsistent with this track's own current
+                # velocity estimate -- almost certainly a nearby-but-unrelated
+                # target (see this module's docstring). Treated as no signal
+                # for this frame rather than folded in: doesn't reset
+                # progress toward anything, just never starts a streak.
+                track.radar_streak = 0
+                track.radar_miss_streak += 1
+        else:
+            track.radar_streak = 0
+
+        speed = np.linalg.norm(track.kf.velocity[:2])
+        if speed > 0.5:
+            track.heading_deg = float(np.degrees(np.arctan2(track.kf.velocity[1], track.kf.velocity[0])))
+
+        if det["class_name"] != "unknown":
+            track.class_name = det["class_name"]
+            track.class_confidence = det["confidence"]
+        elif track.class_name == "unknown":
+            track.class_confidence = max(track.class_confidence, det["confidence"])
+
+        track.size = det["size"]
+        track.sensor_sources = set(det["sensor_sources"])
+        track.hits += 1
+        track.misses = 0
+        track.last_update_time = timestamp
+        track.refresh_static_flag()
+
+    def _spawn_track(self, det: dict, timestamp: float) -> None:
+        kf = KalmanFilter6D(det["position_world"])
+        track = Track(
+            track_id=next(self._next_id),
+            kf=kf,
+            class_name=det["class_name"],
+            class_confidence=det["confidence"],
+            size=det["size"],
+            sensor_sources=set(det["sensor_sources"]),
+            created_at=timestamp,
+            last_update_time=timestamp,
+        )
+        self.tracks.append(track)
+
+    def confirmed_tracks(self) -> list[Track]:
+        return [t for t in self.tracks if t.status == "confirmed"]
