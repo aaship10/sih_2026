@@ -22,24 +22,28 @@ from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import JSONResponse
 from ultralytics import YOLO
 
+from image_preprocessor import WeatherPreprocessor
+
 LOGGER = logging.getLogger("perception_server")
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
 
-MODEL_PATH = Path(os.getenv("YOLO_MODEL_PATH", "best.pt"))
-CLASSES_PATH = Path(os.getenv("CLASSES_YAML_PATH", "classes.yaml"))
-WARMUP_IMAGE_PATH = Path(os.getenv("WARMUP_IMAGE_PATH", "test.jpg"))
+BASE_DIR = Path(__file__).resolve().parent
+MODEL_PATH = Path(os.getenv("YOLO_MODEL_PATH", BASE_DIR / "best.pt"))
+CLASSES_PATH = Path(os.getenv("CLASSES_YAML_PATH", BASE_DIR / "classes.yaml"))
+WARMUP_IMAGE_PATH = Path(os.getenv("WARMUP_IMAGE_PATH", BASE_DIR / "test.jpg"))
 M3_DOWNSTREAM_URL = os.getenv(
     "M3_DOWNSTREAM_URL", "http://127.0.0.1:9000/api/v1/downstream"
 )
 M3_TIMEOUT_SECONDS = float(os.getenv("M3_TIMEOUT_SECONDS", "10"))
-YOLO_CONFIDENCE = float(os.getenv("YOLO_CONFIDENCE", "0.05"))
+YOLO_CONFIDENCE = float(os.getenv("YOLO_CONFIDENCE", "0.15"))
 YOLO_IOU = float(os.getenv("YOLO_IOU", "0.45"))
 YOLO_IMAGE_SIZE = int(os.getenv("YOLO_IMAGE_SIZE", "1280"))
 YOLO_DEVICE = os.getenv("YOLO_DEVICE", "")
 MAX_IMAGE_BYTES = int(os.getenv("MAX_IMAGE_BYTES", str(25 * 1024 * 1024)))
+WEATHER_MODE = os.getenv("WEATHER_MODE", "auto")
 
 
 class PerceptionRuntime:
@@ -51,6 +55,7 @@ class PerceptionRuntime:
         self.model_error: str | None = None
         self.warmed_up = False
         self.inference_lock = threading.Lock()
+        self.preprocessor = WeatherPreprocessor(mode=WEATHER_MODE)
 
     @property
     def device(self) -> str:
@@ -279,6 +284,9 @@ async def log_request_time(request: Request, call_next):
     response.headers["X-Process-Time"] = str(process_time)
     return response
 
+@app.get("/")
+async def root():
+    return {"message": "M2 Perception Server is running", "docs": "/docs", "health": "/health"}
 
 @app.post("/api/v1/perception")
 async def perception(
@@ -308,16 +316,26 @@ async def perception(
     decoded_image = decode_image(image_bytes)
     t2 = time.perf_counter()
 
+    # Weather-adaptive pre-processing (fog/haze/rain removal)
+    decoded_image, detected_weather = runtime.preprocessor.preprocess(decoded_image)
+    t2b = time.perf_counter()
+
     try:
         camera_detections = await asyncio.to_thread(
             runtime.predict_detections, decoded_image
         )
 
+
         # Log the number of detections for this frame (DEBUGGING)
+        from collections import Counter
+        class_counts = Counter(det["class_name"] for det in camera_detections)
+        breakdown_str = ", ".join(f"{name}: {count}" for name, count in class_counts.items())
+
         LOGGER.info(
-            "[M2] frame=%s | detections=%d",
+            "[M2] frame=%s | total_objects=%d | breakdown={ %s }",
             frame_id,
             len(camera_detections),
+            breakdown_str or "none",
         )
 
     except RuntimeError as exc:
@@ -341,11 +359,13 @@ async def perception(
     t4 = time.perf_counter()
     
     LOGGER.info(
-        "Frame %s breakdown: read_files=%.2f ms, decode_image=%.2f ms, inference=%.2f ms, forward_m3=%.2f ms, total=%.2f ms",
+        "Frame %s breakdown: read_files=%.2f ms, decode_image=%.2f ms, preprocess=%.2f ms (%s), inference=%.2f ms, forward_m3=%.2f ms, total=%.2f ms",
         frame_id,
         (t1 - t0) * 1000.0,
         (t2 - t1) * 1000.0,
-        (t3 - t2) * 1000.0,
+        (t2b - t2) * 1000.0,
+        detected_weather,
+        (t3 - t2b) * 1000.0,
         (t4 - t3) * 1000.0,
         (t4 - t0) * 1000.0,
     )
@@ -354,6 +374,7 @@ async def perception(
         content={
             "status": "ok",
             "frame_id": frame_id,
+            "detected_weather": detected_weather,
             "camera_detections_count": len(camera_detections),
             "lidar_bytes_received": len(lidar_bytes),
             "radar_bytes_received": len(radar_bytes),
@@ -376,6 +397,7 @@ async def health() -> JSONResponse:
             "gpu_available": bool(torch.cuda.is_available()),
             "gpu_name": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None,
             "warmed_up": runtime.warmed_up,
+            "weather_mode": WEATHER_MODE,
             "m3_downstream_url": M3_DOWNSTREAM_URL,
         },
     )
@@ -393,7 +415,3 @@ if __name__ == "__main__":
 
 
 __all__ = ["app", "forward_to_m3", "load_class_names", "runtime"]
-
-
-
-
