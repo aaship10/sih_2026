@@ -1,8 +1,6 @@
 # SIH 2026: Autonomous Driving Pipeline
 
 **Team Name:** Mathletics (Team ID: 131459)  
-**Problem Statement Title:** Adaptive Path Planning and Collision Avoidance for Autonomous Vehicles on Unstructured Indian Roads  
-**Problem Statement ID:** SIH26037  
 **Theme:** Smart Vehicles  
 **PS Category:** Software  
 
